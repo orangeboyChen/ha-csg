@@ -107,7 +107,7 @@ def test_ledger_billing_correction_and_settlement_lock() -> None:
     )
     assert cost_total == 6
     assert changes == {"2026-08-01": ({"kwh": 10.0}, {"kwh": 12.0, "charge": 6.0})}
-    run(ledger.async_acknowledge_corrections("account", changes))
+    run(ledger.async_acknowledge_corrections("account", {"2026-08-01": {"kwh"}}))
     assert run(ledger.async_record_realtime("account", "2026-08-01", 13)) == 10
 
     cost_total, changes = run(
@@ -149,8 +149,37 @@ def test_ledger_retries_pending_corrections_until_acknowledged() -> None:
 
     _, retry = run(ledger.async_record_billing("account", []))
     assert retry == corrections
-    run(ledger.async_acknowledge_corrections("account", corrections))
+    run(ledger.async_acknowledge_corrections("account", {"2026-08-01": {"kwh"}}))
     assert run(ledger.async_record_billing("account", []))[1] == {}
+
+
+def test_ledger_keeps_unacknowledged_statistics_corrections() -> None:
+    """A failed cost correction must not retry an acknowledged usage adjustment."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 1))
+    _, corrections = run(
+        ledger.async_record_billing(
+            "account", [{"date": "2026-08-01", "kwh": 2, "charge": 1}]
+        )
+    )
+    run(ledger.async_acknowledge_corrections("account", {"2026-08-01": {"kwh"}}))
+    _, corrections = run(
+        ledger.async_record_billing(
+            "account", [{"date": "2026-08-01", "kwh": 3, "charge": 2}]
+        )
+    )
+
+    run(ledger.async_acknowledge_corrections("account", {"2026-08-01": {"kwh"}}))
+    _, retry = run(ledger.async_record_billing("account", []))
+
+    assert corrections["2026-08-01"] == (
+        {"kwh": 2.0, "charge": 1.0},
+        {"kwh": 3.0, "charge": 2.0},
+    )
+    assert retry["2026-08-01"] == (
+        {"kwh": 3.0, "charge": 1.0},
+        {"kwh": 3.0, "charge": 2.0},
+    )
 
 
 def test_sensor_uses_initial_coordinator_data_and_clears_missing_values() -> None:

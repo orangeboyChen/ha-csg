@@ -221,13 +221,24 @@ class EnergyLedger:
     async def async_acknowledge_corrections(
         self,
         account: str,
-        corrections: dict[str, tuple[dict[str, float], dict[str, float]]],
+        acknowledgements: dict[str, set[str]],
     ) -> None:
-        """Remove corrections only after Recorder has accepted them."""
+        """Record individual Recorder adjustments without losing failed ones."""
         async with self._lock:
             pending = self._account(account).setdefault("pending_corrections", {})
-            for day, (_, current) in corrections.items():
-                if day in pending and pending[day][1] == current:
+            for day, keys in acknowledgements.items():
+                if day not in pending:
+                    continue
+                previous, current = pending[day]
+                previous = dict(previous)
+                for key in keys:
+                    if key in current:
+                        previous[key] = current[key]
+                pending[day] = (previous, current)
+                if all(
+                    key not in previous or current.get(key, 0) == previous[key]
+                    for key in (WF_ATTR_KWH, WF_ATTR_CHARGE)
+                ):
                     del pending[day]
             await self._store.async_save(self._data)
 
@@ -473,10 +484,13 @@ class BillingCoordinator(CSGCoordinator):
             data[SUFFIX_SETTLED_COST_TOTAL] = total_cost
         else:
             data[SUFFIX_SETTLED_COST_TOTAL] = STATE_UNAVAILABLE
-        if await self._async_correct_statistics(account.account_number, changed_days):
-            await self.ledger.async_acknowledge_corrections(
+            acknowledgements = await self._async_correct_statistics(
                 account.account_number, changed_days
             )
+            if acknowledgements:
+                await self.ledger.async_acknowledge_corrections(
+                    account.account_number, acknowledgements
+                )
         await self._add_year_data(client, account, data)
         return data
 
@@ -501,15 +515,15 @@ class BillingCoordinator(CSGCoordinator):
         self,
         account: str,
         changed_days: dict[str, tuple[dict[str, float], dict[str, float]]],
-    ) -> bool:
+    ) -> dict[str, set[str]]:
         """Adjust corrected daily energy and cost sums through Recorder."""
         if not changed_days:
-            return True
+            return {}
         try:
             from homeassistant.components.recorder import get_instance
         except ImportError:
             _LOGGER.warning("Recorder external statistics API unavailable; skipped bill correction")
-            return False
+            return {}
         try:
             statistics = (
                 (self._statistic_id(account, SUFFIX_ENERGY_TOTAL), WF_ATTR_KWH, "kWh"),
@@ -517,22 +531,24 @@ class BillingCoordinator(CSGCoordinator):
             )
         except ValueError as err:
             _LOGGER.warning("Skipped bill correction: %s", err)
-            return False
-        try:
-            for day, (previous, current) in changed_days.items():
-                start = dt_util.start_of_local_day(dt.date.fromisoformat(day))
-                for statistic_id, key, unit in statistics:
-                    if key not in previous:
-                        continue
-                    adjustment = current.get(key, 0) - previous[key]
-                    if adjustment:
+            return {}
+        acknowledgements: dict[str, set[str]] = {}
+        for day, (previous, current) in changed_days.items():
+            start = dt_util.start_of_local_day(dt.date.fromisoformat(day))
+            for statistic_id, key, unit in statistics:
+                if key not in previous:
+                    continue
+                adjustment = current.get(key, 0) - previous[key]
+                if adjustment:
+                    try:
                         get_instance(self.hass).async_adjust_statistics(
                             statistic_id, start, adjustment, unit
                         )
-        except Exception:  # Recorder failures must leave corrections pending.
-            _LOGGER.exception("Could not correct bill statistics")
-            return False
-        return True
+                    except Exception:  # Keep this statistic's correction pending.
+                        _LOGGER.exception("Could not correct bill statistic %s", statistic_id)
+                        continue
+                acknowledgements.setdefault(day, set()).add(key)
+        return acknowledgements
 
     def _statistic_id(self, account: str, suffix: str) -> str:
         """Return the Recorder statistic ID after any user entity-ID rename."""
