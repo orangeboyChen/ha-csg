@@ -8,7 +8,6 @@ Steps:
 """
 from __future__ import annotations
 
-import copy
 import logging
 import time
 from typing import Any
@@ -333,7 +332,7 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._reauth_entry:
             # reauth
             # save the old config and only update the auth related data
-            old_config = copy.deepcopy(self._reauth_entry.data)
+            old_config = self._reauth_entry.data
             data[CONF_ELE_ACCOUNTS] = old_config[CONF_ELE_ACCOUNTS]
             data[CONF_SETTINGS] = old_config[CONF_SETTINGS]
             self.hass.config_entries.async_update_entry(self._reauth_entry, data=data)
@@ -404,8 +403,13 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
             for account in self.all_electricity_accounts:
                 if account.account_number == account_num_to_add:
                     # store the account config in main entry instead of creating new entries
-                    new_data = copy.deepcopy(self._entry.data)
-                    new_data[CONF_ELE_ACCOUNTS][account_num_to_add] = account.dump()
+                    new_data = {
+                        **self._entry.data,
+                        CONF_ELE_ACCOUNTS: {
+                            **self._entry.data[CONF_ELE_ACCOUNTS],
+                            account_num_to_add: account.dump(),
+                        },
+                    }
                     # this must be set or update won't be detected
                     new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
                     self.hass.config_entries.async_update_entry(
@@ -488,8 +492,13 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is None:
             return self.async_show_form(step_id=STEP_SETTINGS, data_schema=schema)
 
-        new_data = copy.deepcopy(self._entry.data)
-        new_data[CONF_SETTINGS][CONF_UPDATE_INTERVAL] = user_input[CONF_UPDATE_INTERVAL]
+        new_data = {
+            **self._entry.data,
+            CONF_SETTINGS: {
+                **self._entry.data[CONF_SETTINGS],
+                CONF_UPDATE_INTERVAL: user_input[CONF_UPDATE_INTERVAL],
+            },
+        }
         new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
         self.hass.config_entries.async_update_entry(
             self._entry,
