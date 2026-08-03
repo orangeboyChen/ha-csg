@@ -142,6 +142,7 @@ class EnergyLedger:
     async def async_record_realtime(self, account: str, day: str, value: float) -> float:
         async with self._lock:
             ledger = self._account(account)
+            ledger.setdefault("energy_started_on", day)
             realtime = ledger.setdefault("realtime", {})
             realtime[day] = value
             if day in ledger.setdefault("billing", {}):
@@ -153,7 +154,7 @@ class EnergyLedger:
                 ledger["energy_total"] = float(ledger.get("energy_total", 0)) + value - reported
                 reported_days[day] = value
             await self._store.async_save(self._data)
-            return float(ledger["energy_total"])
+            return float(ledger.setdefault("energy_total", 0.0))
 
     async def async_record_billing(
         self, account: str, days: Iterable[dict[str, float | str]]
@@ -161,6 +162,7 @@ class EnergyLedger:
         async with self._lock:
             ledger = self._account(account)
             billing = ledger.setdefault("billing", {})
+            reported_energy_days = ledger.setdefault("reported_realtime", {})
             reported_cost_days = ledger.setdefault("reported_cost_days", {})
             changed: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
             for item in days:
@@ -180,14 +182,24 @@ class EnergyLedger:
                     billing[day] = merged
                 if previous != merged:
                     changed[day] = (previous, merged)
+                usage = merged.get(WF_ATTR_KWH)
+                reported_usage = reported_energy_days.get(day)
+                if usage is not None and (
+                    reported_usage is not None
+                    or day >= ledger.get("energy_started_on", "9999-12-31")
+                ):
+                    baseline = float(reported_usage or 0)
+                    ledger["energy_total"] = float(ledger.get("energy_total", 0)) + usage - baseline
+                    reported_energy_days[day] = usage
+                    if WF_ATTR_KWH not in previous:
+                        changed[day] = ({**previous, WF_ATTR_KWH: baseline}, merged)
                 charge = merged.get(WF_ATTR_CHARGE)
-                if charge is not None and day not in reported_cost_days:
-                    ledger["settled_cost_total"] = float(
-                        ledger.get("settled_cost_total", 0)
-                    ) + charge
+                reported_charge = reported_cost_days.get(day)
+                if charge is not None and reported_charge != charge:
+                    ledger["settled_cost_total"] = float(ledger.get("settled_cost_total", 0)) + charge - float(reported_charge or 0)
                     reported_cost_days[day] = charge
             await self._store.async_save(self._data)
-            return float(ledger["settled_cost_total"]), changed
+            return float(ledger.setdefault("settled_cost_total", 0.0)), changed
 
     def billing_days(self, account: str) -> dict[str, dict[str, float]]:
         return self._account(account).get("billing", {})
@@ -231,7 +243,7 @@ class CSGSensor(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator: DataUpdateCoordinator, account: str, description: SensorDescription) -> None:
         super().__init__(coordinator)
         self._account = account
-        self.entity_description = description
+        self._description = description
         self._attr_unique_id = f"{DOMAIN}.{account}.{description.suffix}"
         self._attr_translation_key = description.translation_key
         self._attr_translation_placeholders = {"account": account}
@@ -240,6 +252,8 @@ class CSGSensor(CoordinatorEntity, SensorEntity):
         self._attr_state_class = description.state_class
         self._attr_icon = description.icon
         self._attributes_key = description.attributes_key
+        self._value_present = False
+        self._update_from_coordinator()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -252,12 +266,28 @@ class CSGSensor(CoordinatorEntity, SensorEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        value = (self.coordinator.data or {}).get(self._account, {}).get(self.entity_description.suffix)
-        self._attr_available = value is not None and value != STATE_UNAVAILABLE
-        if self._attr_available:
-            self._attr_native_value = value
-            self._attr_extra_state_attributes = (self.coordinator.data[self._account].get(self._attributes_key, {}) if self._attributes_key else {})
+        self._update_from_coordinator()
         self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Return whether this sensor has a current value."""
+        return super().available and self._value_present
+
+    def _update_from_coordinator(self) -> None:
+        """Synchronize the cached state with the coordinator's latest data."""
+        value = (self.coordinator.data or {}).get(self._account, {}).get(self._description.suffix)
+        self._value_present = value is not None and value != STATE_UNAVAILABLE
+        if self._value_present:
+            self._attr_native_value = value
+            self._attr_extra_state_attributes = (
+                self.coordinator.data[self._account].get(self._attributes_key, {})
+                if self._attributes_key
+                else {}
+            )
+        else:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
 
 
 class CSGCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -269,7 +299,6 @@ class CSGCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         super().__init__(
             hass,
             _LOGGER,
-            config_entry=entry,
             name=name,
             update_interval=timedelta(
                 seconds=entry.data[CONF_SETTINGS][CONF_UPDATE_INTERVAL]

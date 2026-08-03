@@ -25,6 +25,7 @@ from custom_components.csg.sensor import (
     REALTIME_DESCRIPTIONS,
     SETTLED_COST_TOTAL,
     BillingCoordinator,
+    CSGSensor,
     EnergyLedger,
     _ladder_data,
     _merge_daily_days,
@@ -83,6 +84,16 @@ def test_ledger_records_realtime_usage_once_per_day() -> None:
     assert run(ledger.async_record_realtime("account", "2026-08-02", 4)) == 16
 
 
+def test_ledger_initializes_zero_totals() -> None:
+    """Valid zero readings must not leave the running totals undefined."""
+    ledger = make_ledger()
+
+    assert run(ledger.async_record_realtime("account", "2026-08-01", 0)) == 0
+    assert run(
+        ledger.async_record_billing("account", [{"date": "2026-08-01", "kwh": 0}])
+    )[0] == 0
+
+
 def test_ledger_billing_correction_and_settlement_lock() -> None:
     """Billing changes are reported for Recorder and never double-count usage."""
     ledger = make_ledger()
@@ -95,20 +106,50 @@ def test_ledger_billing_correction_and_settlement_lock() -> None:
     )
     assert cost_total == 6
     assert changes == {"2026-08-01": ({"kwh": 10.0}, {"kwh": 12.0, "charge": 6.0})}
-    assert run(ledger.async_record_realtime("account", "2026-08-01", 13)) == 10
+    assert run(ledger.async_record_realtime("account", "2026-08-01", 13)) == 12
 
     cost_total, changes = run(
         ledger.async_record_billing(
             "account", [{"date": "2026-08-01", "kwh": 12, "charge": 7}]
         )
     )
-    assert cost_total == 6
+    assert cost_total == 7
     assert changes == {
         "2026-08-01": (
             {"kwh": 12.0, "charge": 6.0},
             {"kwh": 12.0, "charge": 7.0},
         )
     }
+
+
+def test_ledger_imports_billing_usage_missed_after_installation() -> None:
+    """Settled usage fills a post-installation realtime polling gap."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 1))
+
+    _, changes = run(
+        ledger.async_record_billing(
+            "account", [{"date": "2026-08-02", "kwh": 4, "charge": 2}]
+        )
+    )
+
+    assert ledger.energy_total("account") == 5
+    assert changes["2026-08-02"] == ({"kwh": 0.0}, {"kwh": 4.0, "charge": 2.0})
+
+
+def test_sensor_uses_initial_coordinator_data_and_clears_missing_values() -> None:
+    """Sensors expose the first refresh and never retain a failed value."""
+    coordinator = SimpleNamespace(
+        data={"account": {SUFFIX_ENERGY_TOTAL: 3.5}}, last_update_success=True
+    )
+    sensor = CSGSensor(coordinator, "account", ENERGY_TOTAL)
+
+    assert sensor.native_value == 3.5
+    assert sensor.available
+    coordinator.data = {"account": {SUFFIX_ENERGY_TOTAL: STATE_UNAVAILABLE}}
+    sensor._update_from_coordinator()
+    assert sensor.native_value is None
+    assert not sensor.available
 
 
 def test_ledger_keeps_accounts_and_cost_days_independent() -> None:

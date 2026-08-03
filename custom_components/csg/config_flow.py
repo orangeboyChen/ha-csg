@@ -76,7 +76,7 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Create the options flow."""
-        return CSGOptionsFlowHandler()
+        return CSGOptionsFlowHandler(config_entry)
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -368,6 +368,16 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class CSGOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for China Southern Power Grid Statistics."""
 
+    def __init__(self, config_entry: config_entries.ConfigEntry | None = None) -> None:
+        """Retain the entry for Home Assistant versions before OptionsFlow exposed it."""
+        self._legacy_config_entry = config_entry
+        self.all_electricity_accounts: list[CSGElectricityAccount] = []
+
+    @property
+    def _entry(self) -> config_entries.ConfigEntry:
+        """Return the config entry on both supported OptionsFlow APIs."""
+        return self._legacy_config_entry or self.config_entry
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -394,22 +404,22 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
             for account in self.all_electricity_accounts:
                 if account.account_number == account_num_to_add:
                     # store the account config in main entry instead of creating new entries
-                    new_data = copy.deepcopy(self.config_entry.data)
+                    new_data = copy.deepcopy(self._entry.data)
                     new_data[CONF_ELE_ACCOUNTS][account_num_to_add] = account.dump()
                     # this must be set or update won't be detected
                     new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
                     self.hass.config_entries.async_update_entry(
-                        self.config_entry,
+                        self._entry,
                         data=new_data,
                     )
                     _LOGGER.info(
                         "Added ele account to %s: %s",
-                        self.config_entry.data[CONF_USERNAME],
+                        self._entry.data[CONF_USERNAME],
                         account_num_to_add,
                     )
                     _LOGGER.info("Reloading entry because of new added account")
                     await self.hass.config_entries.async_reload(
-                        self.config_entry.entry_id
+                        self._entry.entry_id
                     )
                     return self.async_create_entry(
                         title="",
@@ -420,7 +430,7 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         # start of getting all unbound accounts
         client = CSGClient.load(
             {
-                CONF_AUTH_TOKEN: self.config_entry.data[CONF_AUTH_TOKEN],
+                CONF_AUTH_TOKEN: self._entry.data[CONF_AUTH_TOKEN],
             }
         )
         logged_in = await self.hass.async_add_executor_job(client.verify_login)
@@ -436,7 +446,7 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         if not accounts:
             _LOGGER.warning(
                 "No linked ele accounts found in csg account %s",
-                self.config_entry.data[CONF_USERNAME],
+                self._entry.data[CONF_USERNAME],
             )
             return self.async_abort(reason=ABORT_NO_ACCOUNT)
         selections = {}
@@ -449,7 +459,7 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         if not selections:
             _LOGGER.info(
                 "Account %s: no ele account to add (all already added), abort",
-                self.config_entry.data[CONF_USERNAME],
+                self._entry.data[CONF_USERNAME],
             )
             return self.async_abort(reason=ABORT_ALL_ADDED)
 
@@ -467,7 +477,7 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Settings of parameters"""
-        update_interval = self.config_entry.data[CONF_SETTINGS][CONF_UPDATE_INTERVAL]
+        update_interval = self._entry.data[CONF_SETTINGS][CONF_UPDATE_INTERVAL]
         schema = vol.Schema(
             {
                 vol.Required(CONF_UPDATE_INTERVAL, default=update_interval): vol.All(
@@ -478,14 +488,14 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is None:
             return self.async_show_form(step_id=STEP_SETTINGS, data_schema=schema)
 
-        new_data = copy.deepcopy(self.config_entry.data)
+        new_data = copy.deepcopy(self._entry.data)
         new_data[CONF_SETTINGS][CONF_UPDATE_INTERVAL] = user_input[CONF_UPDATE_INTERVAL]
         new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
         self.hass.config_entries.async_update_entry(
-            self.config_entry,
+            self._entry,
             data=new_data,
         )
-        await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+        await self.hass.config_entries.async_reload(self._entry.entry_id)
         return self.async_create_entry(
             title="",
             data={},
