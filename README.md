@@ -1,4 +1,4 @@
-# CSG
+# ha-csg
 
 Home Assistant custom integration for China Southern Power Grid electricity data.
 
