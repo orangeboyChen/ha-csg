@@ -1,155 +1,101 @@
-# China Southern Power Grid Statistics
+# CSG
 
-# 南方电网电费数据HA集成
+Home Assistant custom integration for China Southern Power Grid electricity data.
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/cubicpill/china_southern_power_grid_stat)](https://github.com/CubicPill/china_southern_power_grid_stat/releases)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+This project is a fork of [CubicPill/china_southern_power_grid_stat](https://github.com/CubicPill/china_southern_power_grid_stat).
+It uses the `csg` integration domain and redesigns the entities for correct Home
+Assistant statistics and Energy dashboard use.
 
-## 支持功能
+## Features
 
-- ✅支持南方电网覆盖范围内的电费数据查询（广东、广西、云南、贵州、海南）
-- ✅支持使用手机号、短信验证码和密码（可选）登录，支持南网在线APP、微信、支付宝扫码登录
-- ✅支持多个南网账户（每个账户一个集成），支持单个账户下的多个缴费号
-- ✅数据自动抓取和更新（默认间隔4小时，可配置）
-- ✅全程GUI配置，无需编辑yaml进行配置（暂不支持yaml配置）
+- Supports accounts in the China Southern Power Grid service area: Guangdong,
+  Guangxi, Yunnan, Guizhou, and Hainan.
+- Supports SMS, SMS plus password, CSG App QR code, WeChat QR code, and Alipay
+  QR code login.
+- Supports multiple CSG accounts and multiple payment accounts per CSG account.
+- Uses Home Assistant's UI configuration flow; YAML configuration is not supported.
+- Keeps the full payment account number in device and entity names.
 
-可接入如下数据：
+## Data freshness
 
-- 当前余额和欠费
-- 当前阶梯电量数据（档位、阶梯剩余电量、阶梯电价）
-- 昨日用电量
-- 最新一日用电量、电费（取有数据的最近一日）
-- 本年度总用电量、总电费（非实时，更新到上个月）
-- 本年度每月用电量、电费（非实时，更新到上个月）
-- 上年度总用电量、总电费
-- 上年度每月用电量、电费
-- 当月累计用电量、电费（非实时，有2天左右的延迟）
-- 当月每日用电量、电费（非实时，有2天左右的延迟）
-- 上月累计用电量、电费
-- 上月每日用电量、电费
+The following classifications follow the upstream integration README and its API
+mapping. They describe data freshness, not endpoint naming.
 
-❌**不支持**阶梯电费设置（仅能获取当前所在阶梯）、峰谷电价设置和电费计算（本插件只进行数据抓取和转换，不进行任何计算），
-暂时也没有支持计划（南网暂时没有统一的API），如有需求，建议单独创建对应的电价实体。
+| Data | Source | Freshness |
+| --- | --- | --- |
+| Balance and arrears | `queryUserAccountNumberSurplus` | Realtime |
+| Current ladder tier, remaining allowance, and tariff | `queryDayElectricChargeByMPoint` ladder fields | Realtime |
+| Yesterday's electricity usage | `queryDayElectricByMPointYesterday` | Realtime |
+| Daily usage, daily cost, monthly totals | `queryDayElectricByMPoint` and `queryDayElectricChargeByMPoint` | Delayed by about two days for the current month |
+| Current and previous year totals | `getAnalyzeFeeDetails` | Non-realtime; current year is updated through the previous month |
 
-❌因为南网登录API调整，不再支持登录态失效之后自动重新登录，需要手动重新登录。
-## 使用方法
+“Realtime” yesterday usage is still a daily value. It is not live power or
+today's accumulated consumption.
 
-使用[HACS](https://hacs.xyz/)或[手动下载安装](https://github.com/CubicPill/china_southern_power_grid_stat/releases)
+## Entities
 
-注意：本集成需求`Home Assistant`最低版本为`2022.11`。
+Each payment account provides the following sensors:
 
-### 配置界面
+- Energy total: cumulative `kWh` for the Home Assistant Energy dashboard.
+- Settled cost total: cumulative `CNY` cost for Energy dashboard cost tracking.
+- Yesterday usage, balance, and arrears.
+- Current ladder tier, remaining energy, and tariff.
+- Latest settlement-day usage and cost.
+- This month, last month, this year, and last year usage and cost totals.
 
-支持的登录方式
+Only **Energy total** and **Settled cost total** use the
+`total_increasing` state class. All query snapshots use `measurement` or no
+state class, so Home Assistant does not mistake a monthly or yearly snapshot
+for a continuously increasing meter.
 
-<img src="https://raw.githubusercontent.com/CubicPill/china_southern_power_grid_stat/master/img/setup_login.png" alt="" style="width: 400px;">
+## Energy dashboard and billing corrections
 
-配置界面
+Energy total advances from the realtime yesterday-usage API. When the delayed
+daily bill becomes available, the integration compares its `result[].power` and
+`result[].charge` values with stored data and corrects existing Home Assistant
+Recorder statistics for that date.
 
-<img src="https://raw.githubusercontent.com/CubicPill/china_southern_power_grid_stat/master/img/setup_add_account.png" alt="" style="width: 400px;">
+The cumulative entities never decrease: historical bill corrections update the
+Recorder's historical sums rather than resetting a `total_increasing` meter.
+The first installation does not fabricate historical entity states from an old
+bill. Cost is taken only from the settled daily `charge` value; the current
+ladder tariff is never used to estimate cost.
 
-添加缴费号
+To configure Home Assistant Energy, select:
 
-<img src="https://raw.githubusercontent.com/CubicPill/china_southern_power_grid_stat/master/img/setup_select_account.png" alt="" style="width: 400px;">
+- **Energy total** as the electricity consumption source.
+- **Settled cost total** as the entity-with-total-cost source.
 
-传感器列表
-- 余额
-- 欠费
-- 当前阶梯档位
-- 当前阶梯剩余电量
-- 当前阶梯电价
-- 上月电费
-- 上月用电量
-- 当月用电量
-- 当月电费
-- 本年度电费
-- 本年度用电量
-- 上年度电费
-- 上年度用电量
-- 最近日用电量
-- 最近日电费
-- 昨日用电量
+## Installation
 
+Install through [HACS](https://hacs.xyz/) or download a release from
+[orangeboyChen/ha-csg](https://github.com/orangeboyChen/ha-csg/releases).
 
+Home Assistant `2024.4` or newer is required.
 
+## Breaking upgrade to v2
 
-传感器额外参数（每月用量、每日用量）
+Version 2 changes the integration domain from
+`china_southern_power_grid_stat` to `csg`. There is no automatic migration.
 
-<img src="https://raw.githubusercontent.com/CubicPill/china_southern_power_grid_stat/master/img/sensor_attr.png" alt="" style="width: 400px;">
+1. Remove the old integration.
+2. Restart Home Assistant.
+3. Add **CSG** again and configure the account.
+4. Remove old devices, entities, and historical statistics if they are no longer needed.
 
-参数设置
+## Update intervals
 
-<img src="https://raw.githubusercontent.com/CubicPill/china_southern_power_grid_stat/master/img/setup_params.png" alt="" style="width: 400px;">
+Balance, arrears, ladder state, and yesterday usage refresh at the configured
+interval (four hours by default). Daily billing details, monthly summaries, and
+yearly summaries refresh once per day.
 
-### 数据更新策略
+## API implementation
 
-由于上月数据和去年数据在生成之后一般不会发生变化，因此对于上月累计用电量、上月每日用电量、上年度累计用电量、上年度每月用电量，数据更新间隔将会与一般更新间隔有所不同。
-具体更新策略如下：
+[`custom_components/csg/csg_client/__init__.py`](custom_components/csg/csg_client/__init__.py)
+implements the CSG App API and can be used independently. See
+`csg_client_demo.py` for a basic example.
 
-对于上月数据，在每月前3天（1~3日）将会跟随一般更新间隔更新（默认为4小时），其余时间将会停止更新，但数据依然可用。
+## Credits
 
-对于去年数据，在每年一月的前7天（1月1日~1月7日）将会每天更新（在每天第一次触发更新时更新），其余时间将会停止更新，但数据依然可用。
-
-如果需要强制刷新数据，重载集成即可。
-
-## 一些技术细节
-
-### 登录接口加密原理
-
-登录接口的请求数据和返回数据都经过加密，其中请求数据经过两层加密：整个请求数据的`AES`加密和密码字段的`RSA`
-公钥加密（密钥、公钥具体值见代码）。
-
-加密前的请求数据结构如下：
-
-```json5
-{
-  "areaCode": "xxx",
-  "acctId": "xxx",
-  "logonChan": "xxx",
-  "credType": "xxx",
-  "credentials": "xxx"  // <- encrypted with RSA
-}
-```
-
-返回数据同样经过`AES`加密，密钥与请求数据相同。但返回值其中暂时不包含有用信息，验证状态码正常后可以直接忽略内容。
-
-### Web端接口和App端接口
-
-对于南网API相关信息的提取主要通过Web端的抓包和JS代码获取。
-之后因为登录态有效期问题，对App端抓包进行比对后切换到App端API。
-经过验证，Web端（网上营业厅）和App端（南网在线）的API接口基本相同，差别主要在于：
-
-|              | Web                        | App                     |
-|--------------|----------------------------|-------------------------|
-| API路径        | ucs/ma/wt/                 | ucs/ma/zt/              |
-| 支持登录方式       | 手机号+验证码（+密码），南网在线/微信/支付宝扫码 | 手机号+验证码（+密码），微信/支付宝跳转登录 |
-| token有效期     | 几小时（有待进一步确认）               | 较长（有待进一步确认）                      |
-| Cookies      | token包含在cookies中           | 无cookies                |
-| 敏感信息（姓名、地址等） | 部分信息用“*”隐去                 | 有明文全文                   |
-
-另外在HTTP请求头上有细微的差别（如：UA），但实际上对于请求的返回结果没有影响。
-
-### API 实现库
-
-本项目代码中的[`csg_client/__init__.py`](https://github.com/CubicPill/china_southern_power_grid_stat/blob/master/custom_components/china_southern_power_grid_stat/csg_client/__init__.py)
-是对南网在线 App API 的实现，可以独立于此项目单独使用。
-详细使用方法见`csg_client_demo.py`
-
-## Thank you
-- [lyylyylyylyy](https://github.com/lyylyylyylyy): PR [#30](https://github.com/CubicPill/china_southern_power_grid_stat/pull/30) 短信验证码登录支持
-
-感谢[瀚思彼岸](https://bbs.hassbian.com/)论坛以下帖子作者的辛苦付出，排名不分先后
-
-- [不折腾，超简单接入电费数据](https://bbs.hassbian.com/thread-18474-1-1.html)
-- [北京电费查询加强版](https://bbs.hassbian.com/thread-13820-1-1.html)
-- [电费插件（Node-Red流）-广东南方电网](https://bbs.hassbian.com/thread-17830-1-1.html)
-- [【抄作业】电费插件(NR流)-南网](https://bbs.hassbian.com/thread-18122-1-1.html)
-
-自定义集成教程参考：[Building a Home Assistant Custom Component Part 1: Project Structure and Basics](https://aarongodfrey.dev/home%20automation/building_a_home_assistant_custom_component_part_1/)
-
-
-
-
-
-
+- [CubicPill/china_southern_power_grid_stat](https://github.com/CubicPill/china_southern_power_grid_stat), the upstream project.
+- [lyylyylyylyy](https://github.com/lyylyylyylyy), for upstream SMS verification-code login support.

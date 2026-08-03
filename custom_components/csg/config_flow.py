@@ -25,7 +25,6 @@ from .const import (
     ABORT_ALL_ADDED,
     ABORT_NO_ACCOUNT,
     CONF_ACCOUNT_NUMBER,
-    CONF_ACTION,
     CONF_AUTH_TOKEN,
     CONF_ELE_ACCOUNTS,
     CONF_GENERAL_ERROR,
@@ -77,7 +76,7 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Create the options flow."""
-        return CSGOptionsFlowHandler(config_entry)
+        return CSGOptionsFlowHandler()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -108,9 +107,8 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id=STEP_SMS_LOGIN,
                 data_schema=vol.Schema(
                     {
-                        # TODO hardcoded string, should be a reference to strings.json?
                         vol.Required(CONF_USERNAME): vol.All(
-                            str, vol.Length(min=11, max=11), msg="请输入11位手机号"
+                            str, vol.Length(min=11, max=11)
                         )
                     }
                 ),
@@ -129,11 +127,9 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id=STEP_SMS_PWD_LOGIN,
                 data_schema=vol.Schema(
                     {
-                        vol.Required(CONF_USERNAME): vol.All(
-                            str, vol.Length(min=11, max=11), msg="请输入11位手机号"
-                        ),
+                        vol.Required(CONF_USERNAME): vol.All(str, vol.Length(min=11, max=11)),
                         vol.Required(CONF_PASSWORD): vol.All(
-                            str, vol.Length(min=8, max=16), msg="请输入8-16位登陆密码"
+                            str, vol.Length(min=8, max=16)
                         ),  # as shown on CSG web login page
                     }
                 ),
@@ -149,9 +145,7 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle SMS code validation step, for both SMS and SMS+password login."""
         schema = vol.Schema(
             {
-                vol.Required(CONF_SMS_CODE): vol.All(
-                    str, vol.Length(min=6, max=6), msg="请输入6位短信验证码"
-                ),
+                vol.Required(CONF_SMS_CODE): vol.All(str, vol.Length(min=6, max=6)),
             }
         )
         client: CSGClient = CSGClient()
@@ -269,8 +263,8 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
                 ),
                 description_placeholders={
-                    "description": f"<p>使用{LOGIN_TYPE_TO_QR_APP_NAME[login_type]}扫码登录。登录完成后，点击下一步。"
-                    f'</p><img src="{image_link}" alt="QR code" style="width: 200px;"/>',
+                    "app_name": LOGIN_TYPE_TO_QR_APP_NAME[login_type],
+                    "image_link": image_link,
                 },
             )
         if user_input[CONF_REFRESH_QR_CODE]:
@@ -305,10 +299,9 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
             ),
             errors={CONF_GENERAL_ERROR: ERROR_QR_NOT_SCANNED},
-            # had to do this because strings.json conflicts with html tags
             description_placeholders={
-                "description": f"<p>使用{LOGIN_TYPE_TO_QR_APP_NAME[login_type]}扫码登录。登录完成后，点击下一步。</p>"
-                f'<img src="{image_link}" alt="QR code" style="width: 200px;"/>',
+                "app_name": LOGIN_TYPE_TO_QR_APP_NAME[login_type],
+                "image_link": image_link,
             },
         )
 
@@ -375,32 +368,15 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class CSGOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for China Southern Power Grid Statistics."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-        self.all_electricity_accounts: list[CSGElectricityAccount] = []
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
 
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_ACTION, default=STEP_ADD_ACCOUNT): vol.In(
-                    {
-                        STEP_ADD_ACCOUNT: "添加已绑定的缴费号",
-                        STEP_SETTINGS: "参数设置",
-                    }
-                ),
-            }
+        return self.async_show_menu(
+            step_id=STEP_INIT,
+            menu_options=[STEP_ADD_ACCOUNT, STEP_SETTINGS],
         )
-        if user_input:
-            if user_input[CONF_ACTION] == STEP_ADD_ACCOUNT:
-                return await self.async_step_add_account()
-            if user_input[CONF_ACTION] == STEP_SETTINGS:
-                return await self.async_step_settings()
-        return self.async_show_form(step_id=STEP_INIT, data_schema=schema)
 
     async def async_step_add_account(
         self, user_input: dict[str, Any] | None = None
@@ -418,7 +394,7 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
             for account in self.all_electricity_accounts:
                 if account.account_number == account_num_to_add:
                     # store the account config in main entry instead of creating new entries
-                    new_data = self.config_entry.data.copy()
+                    new_data = copy.deepcopy(self.config_entry.data)
                     new_data[CONF_ELE_ACCOUNTS][account_num_to_add] = account.dump()
                     # this must be set or update won't be detected
                     new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
@@ -495,20 +471,21 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
         schema = vol.Schema(
             {
                 vol.Required(CONF_UPDATE_INTERVAL, default=update_interval): vol.All(
-                    int, vol.Range(min=60), msg="刷新间隔不能低于60秒"
+                    int, vol.Range(min=60)
                 ),
             }
         )
         if user_input is None:
             return self.async_show_form(step_id=STEP_SETTINGS, data_schema=schema)
 
-        new_data = self.config_entry.data.copy()
+        new_data = copy.deepcopy(self.config_entry.data)
         new_data[CONF_SETTINGS][CONF_UPDATE_INTERVAL] = user_input[CONF_UPDATE_INTERVAL]
         new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
         self.hass.config_entries.async_update_entry(
             self.config_entry,
             data=new_data,
         )
+        await self.hass.config_entries.async_reload(self.config_entry.entry_id)
         return self.async_create_entry(
             title="",
             data={},

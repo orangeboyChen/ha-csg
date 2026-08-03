@@ -2,6 +2,7 @@
 """The China Southern Power Grid Statistics integration."""
 from __future__ import annotations
 
+import copy
 import logging
 import time
 
@@ -26,8 +27,6 @@ from .csg_client import (
     InvalidCredentials,
     NotLoggedIn,
 )
-from .sensor import CSGCostSensor, CSGEnergySensor
-
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,7 +80,7 @@ async def async_remove_config_entry_device(
         entity_reg.async_remove(entity_id)
 
     # update config entry
-    new_data = config_entry.data.copy()
+    new_data = copy.deepcopy(config_entry.data)
     new_data[CONF_ELE_ACCOUNTS].pop(account_num)
     new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
     hass.config_entries.async_update_entry(
