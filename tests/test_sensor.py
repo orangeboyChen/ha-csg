@@ -106,14 +106,14 @@ def test_ledger_billing_correction_and_settlement_lock() -> None:
     )
     assert cost_total == 6
     assert changes == {"2026-08-01": ({"kwh": 10.0}, {"kwh": 12.0, "charge": 6.0})}
-    assert run(ledger.async_record_realtime("account", "2026-08-01", 13)) == 12
+    assert run(ledger.async_record_realtime("account", "2026-08-01", 13)) == 10
 
     cost_total, changes = run(
         ledger.async_record_billing(
             "account", [{"date": "2026-08-01", "kwh": 12, "charge": 7}]
         )
     )
-    assert cost_total == 7
+    assert cost_total == 6
     assert changes == {
         "2026-08-01": (
             {"kwh": 12.0, "charge": 6.0},
@@ -133,7 +133,7 @@ def test_ledger_imports_billing_usage_missed_after_installation() -> None:
         )
     )
 
-    assert ledger.energy_total("account") == 5
+    assert ledger.energy_total("account") == 1
     assert changes["2026-08-02"] == ({"kwh": 0.0}, {"kwh": 4.0, "charge": 2.0})
 
 

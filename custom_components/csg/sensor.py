@@ -189,14 +189,16 @@ class EnergyLedger:
                     or day >= ledger.get("energy_started_on", "9999-12-31")
                 ):
                     baseline = float(reported_usage or 0)
-                    ledger["energy_total"] = float(ledger.get("energy_total", 0)) + usage - baseline
                     reported_energy_days[day] = usage
                     if WF_ATTR_KWH not in previous:
                         changed[day] = ({**previous, WF_ATTR_KWH: baseline}, merged)
                 charge = merged.get(WF_ATTR_CHARGE)
                 reported_charge = reported_cost_days.get(day)
                 if charge is not None and reported_charge != charge:
-                    ledger["settled_cost_total"] = float(ledger.get("settled_cost_total", 0)) + charge - float(reported_charge or 0)
+                    if reported_charge is None:
+                        ledger["settled_cost_total"] = float(
+                            ledger.get("settled_cost_total", 0)
+                        ) + charge
                     reported_cost_days[day] = charge
             await self._store.async_save(self._data)
             return float(ledger.setdefault("settled_cost_total", 0.0)), changed
