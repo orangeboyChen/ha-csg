@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import async_timeout
 import requests
@@ -71,6 +72,7 @@ from .csg_client import (
 
 _LOGGER = logging.getLogger(__name__)
 _BILLING_DELAY = 2
+_CSG_TIME_ZONE = ZoneInfo("Asia/Shanghai")
 FETCH_EXCEPTIONS = (CSGAPIError, asyncio.TimeoutError, ValueError, requests.RequestException)
 
 
@@ -164,6 +166,7 @@ class EnergyLedger:
             billing = ledger.setdefault("billing", {})
             reported_energy_days = ledger.setdefault("reported_realtime", {})
             reported_cost_days = ledger.setdefault("reported_cost_days", {})
+            pending = ledger.setdefault("pending_corrections", {})
             changed: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
             for item in days:
                 day = str(item[WF_ATTR_DATE])
@@ -200,8 +203,33 @@ class EnergyLedger:
                             ledger.get("settled_cost_total", 0)
                         ) + charge
                     reported_cost_days[day] = charge
+                if previous != merged:
+                    correction_previous, correction_current = changed.get(
+                        day, (previous, merged)
+                    )
+                    original, _ = pending.get(
+                        day, (correction_previous, correction_current)
+                    )
+                    pending[day] = (original, correction_current)
             await self._store.async_save(self._data)
-            return float(ledger.setdefault("settled_cost_total", 0.0)), changed
+            corrections = {
+                day: (dict(previous), dict(current))
+                for day, (previous, current) in pending.items()
+            }
+            return float(ledger.setdefault("settled_cost_total", 0.0)), corrections
+
+    async def async_acknowledge_corrections(
+        self,
+        account: str,
+        corrections: dict[str, tuple[dict[str, float], dict[str, float]]],
+    ) -> None:
+        """Remove corrections only after Recorder has accepted them."""
+        async with self._lock:
+            pending = self._account(account).setdefault("pending_corrections", {})
+            for day, (_, current) in corrections.items():
+                if day in pending and pending[day][1] == current:
+                    del pending[day]
+            await self._store.async_save(self._data)
 
     def billing_days(self, account: str) -> dict[str, dict[str, float]]:
         return self._account(account).get("billing", {})
@@ -331,7 +359,7 @@ class RealtimeCoordinator(CSGCoordinator):
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         client = await self._client()
         data: dict[str, dict[str, Any]] = {}
-        yesterday = (dt_util.now().date() - dt.timedelta(days=1)).isoformat()
+        yesterday = (_csg_today() - dt.timedelta(days=1)).isoformat()
         for account in self._accounts():
             account_data: dict[str, Any] = {}
             try:
@@ -365,7 +393,7 @@ class CurrentCoordinator(CSGCoordinator):
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         client = await self._client()
-        today = dt_util.now().date()
+        today = _csg_today()
         data: dict[str, dict[str, Any]] = {}
         for account in self._accounts():
             try:
@@ -397,7 +425,7 @@ class BillingCoordinator(CSGCoordinator):
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         client = await self._client()
-        now = dt_util.now().date()
+        now = _csg_today()
         previous = now.replace(day=1) - dt.timedelta(days=1)
         months = [(now.year, now.month), (previous.year, previous.month)]
         data: dict[str, dict[str, Any]] = {}
@@ -438,17 +466,22 @@ class BillingCoordinator(CSGCoordinator):
                 _set_latest_day(data, last_month[3])
         else:
             data.update({SUFFIX_LAST_MONTH_KWH: STATE_UNAVAILABLE, SUFFIX_LAST_MONTH_COST: STATE_UNAVAILABLE})
+        total_cost, changed_days = await self.ledger.async_record_billing(
+            account.account_number, daily
+        )
         if daily:
-            total_cost, changed_days = await self.ledger.async_record_billing(account.account_number, daily)
             data[SUFFIX_SETTLED_COST_TOTAL] = total_cost
-            await self._async_correct_statistics(account.account_number, changed_days)
         else:
             data[SUFFIX_SETTLED_COST_TOTAL] = STATE_UNAVAILABLE
+        if await self._async_correct_statistics(account.account_number, changed_days):
+            await self.ledger.async_acknowledge_corrections(
+                account.account_number, changed_days
+            )
         await self._add_year_data(client, account, data)
         return data
 
     async def _add_year_data(self, client: CSGClient, account: CSGElectricityAccount, data: dict[str, Any]) -> None:
-        now = dt_util.now().date()
+        now = _csg_today()
         for year, usage_suffix, cost_suffix in ((now.year, SUFFIX_THIS_YEAR_KWH, SUFFIX_THIS_YEAR_COST), (now.year - 1, SUFFIX_LAST_YEAR_KWH, SUFFIX_LAST_YEAR_COST)):
             try:
                 cost, usage, _ = await self._fetch(client.get_year_month_stats, account, year)
@@ -468,15 +501,15 @@ class BillingCoordinator(CSGCoordinator):
         self,
         account: str,
         changed_days: dict[str, tuple[dict[str, float], dict[str, float]]],
-    ) -> None:
+    ) -> bool:
         """Adjust corrected daily energy and cost sums through Recorder."""
         if not changed_days:
-            return
+            return True
         try:
             from homeassistant.components.recorder import get_instance
         except ImportError:
             _LOGGER.warning("Recorder external statistics API unavailable; skipped bill correction")
-            return
+            return False
         try:
             statistics = (
                 (self._statistic_id(account, SUFFIX_ENERGY_TOTAL), WF_ATTR_KWH, "kWh"),
@@ -484,17 +517,22 @@ class BillingCoordinator(CSGCoordinator):
             )
         except ValueError as err:
             _LOGGER.warning("Skipped bill correction: %s", err)
-            return
-        for day, (previous, current) in changed_days.items():
-            start = dt_util.start_of_local_day(dt.date.fromisoformat(day))
-            for statistic_id, key, unit in statistics:
-                if key not in previous:
-                    continue
-                adjustment = current.get(key, 0) - previous[key]
-                if adjustment:
-                    get_instance(self.hass).async_adjust_statistics(
-                        statistic_id, start, adjustment, unit
-                    )
+            return False
+        try:
+            for day, (previous, current) in changed_days.items():
+                start = dt_util.start_of_local_day(dt.date.fromisoformat(day))
+                for statistic_id, key, unit in statistics:
+                    if key not in previous:
+                        continue
+                    adjustment = current.get(key, 0) - previous[key]
+                    if adjustment:
+                        get_instance(self.hass).async_adjust_statistics(
+                            statistic_id, start, adjustment, unit
+                        )
+        except Exception:  # Recorder failures must leave corrections pending.
+            _LOGGER.exception("Could not correct bill statistics")
+            return False
+        return True
 
     def _statistic_id(self, account: str, suffix: str) -> str:
         """Return the Recorder statistic ID after any user entity-ID rename."""
@@ -517,6 +555,11 @@ def _merge_daily_days(usage_days: list[dict[str, Any]], cost_days: list[dict[str
         if WF_ATTR_CHARGE in item:
             target[WF_ATTR_CHARGE] = item[WF_ATTR_CHARGE]
     return [days[day] for day in sorted(days)]
+
+
+def _csg_today() -> dt.date:
+    """Return the current calendar date used by the CSG API."""
+    return dt_util.utcnow().astimezone(_CSG_TIME_ZONE).date()
 
 
 def _ladder_data(ladder: dict[str, Any]) -> dict[str, Any]:

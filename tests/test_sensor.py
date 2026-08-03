@@ -27,6 +27,7 @@ from custom_components.csg.sensor import (
     BillingCoordinator,
     CSGSensor,
     EnergyLedger,
+    _csg_today,
     _ladder_data,
     _merge_daily_days,
     _set_latest_day,
@@ -106,6 +107,7 @@ def test_ledger_billing_correction_and_settlement_lock() -> None:
     )
     assert cost_total == 6
     assert changes == {"2026-08-01": ({"kwh": 10.0}, {"kwh": 12.0, "charge": 6.0})}
+    run(ledger.async_acknowledge_corrections("account", changes))
     assert run(ledger.async_record_realtime("account", "2026-08-01", 13)) == 10
 
     cost_total, changes = run(
@@ -137,6 +139,20 @@ def test_ledger_imports_billing_usage_missed_after_installation() -> None:
     assert changes["2026-08-02"] == ({"kwh": 0.0}, {"kwh": 4.0, "charge": 2.0})
 
 
+def test_ledger_retries_pending_corrections_until_acknowledged() -> None:
+    """Corrections survive a failed Recorder update and are retried later."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 1))
+    _, corrections = run(
+        ledger.async_record_billing("account", [{"date": "2026-08-01", "kwh": 2}])
+    )
+
+    _, retry = run(ledger.async_record_billing("account", []))
+    assert retry == corrections
+    run(ledger.async_acknowledge_corrections("account", corrections))
+    assert run(ledger.async_record_billing("account", []))[1] == {}
+
+
 def test_sensor_uses_initial_coordinator_data_and_clears_missing_values() -> None:
     """Sensors expose the first refresh and never retain a failed value."""
     coordinator = SimpleNamespace(
@@ -150,6 +166,16 @@ def test_sensor_uses_initial_coordinator_data_and_clears_missing_values() -> Non
     sensor._update_from_coordinator()
     assert sensor.native_value is None
     assert not sensor.available
+
+
+def test_csg_today_uses_china_standard_time(monkeypatch) -> None:
+    """CSG API dates must not depend on Home Assistant's configured timezone."""
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 3, 16, tzinfo=dt.UTC),
+    )
+
+    assert _csg_today() == dt.date(2026, 8, 4)
 
 
 def test_ledger_keeps_accounts_and_cost_days_independent() -> None:
@@ -301,6 +327,7 @@ def test_billing_coordinator_marks_failed_month_unavailable(monkeypatch) -> None
 
     assert data[SUFFIX_LATEST_DAY_KWH] == STATE_UNAVAILABLE
     assert data[SUFFIX_LATEST_DAY_COST] == STATE_UNAVAILABLE
+    assert coordinator.ledger.days == []
 
 
 def test_billing_correction_adjusts_existing_energy_and_cost_statistics(
