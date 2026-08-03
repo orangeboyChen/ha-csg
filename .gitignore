@@ -1,0 +1,14 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments and uv artifacts
+.venv/
+.uv/
+
+# Home Assistant runtime data
+.storage/
+home-assistant_v2.db*

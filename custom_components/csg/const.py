@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from .csg_client import LoginType
 
-DOMAIN = "china_southern_power_grid_stat"
+DOMAIN = "csg"
 
 # config flow
 # main account (phone number)
@@ -44,9 +44,9 @@ ERROR_QR_NOT_SCANNED = "qr_not_scanned"
 
 # UI
 LOGIN_TYPE_TO_QR_APP_NAME = {
-    LoginType.LOGIN_TYPE_CSG_QR: "南网APP",
-    LoginType.LOGIN_TYPE_WX_QR: "微信",
-    LoginType.LOGIN_TYPE_ALI_QR: "支付宝",
+    LoginType.LOGIN_TYPE_CSG_QR: "CSG App",
+    LoginType.LOGIN_TYPE_WX_QR: "WeChat",
+    LoginType.LOGIN_TYPE_ALI_QR: "Alipay",
 }
 
 # api
@@ -55,9 +55,11 @@ LOGIN_TYPE_TO_QR_APP_NAME = {
 # sensor updates
 SUFFIX_BAL = "balance"
 SUFFIX_ARR = "arrears"
+SUFFIX_ENERGY_TOTAL = "energy_total"
+SUFFIX_SETTLED_COST_TOTAL = "settled_cost_total"
 SUFFIX_YESTERDAY_KWH = "yesterday_kwh"
-SUFFIX_LATEST_DAY_KWH = "latest_day_kwh"
-SUFFIX_LATEST_DAY_COST = "latest_day_cost"
+SUFFIX_LATEST_DAY_KWH = "latest_settlement_day_kwh"
+SUFFIX_LATEST_DAY_COST = "latest_settlement_day_cost"
 SUFFIX_THIS_YEAR_KWH = "this_year_total_usage"
 SUFFIX_THIS_YEAR_COST = "this_year_total_cost"
 SUFFIX_THIS_MONTH_KWH = "this_month_total_usage"
@@ -70,15 +72,13 @@ SUFFIX_LAST_YEAR_COST = "last_year_total_cost"
 SUFFIX_LAST_MONTH_KWH = "last_month_total_usage"
 SUFFIX_LAST_MONTH_COST = "last_month_total_cost"
 
-ATTR_KEY_THIS_MONTH_BY_DAY = "this_month_by_day"
-ATTR_KEY_THIS_YEAR_BY_MONTH = "this_year_by_month"
-ATTR_KEY_LAST_MONTH_BY_DAY = "last_month_by_day"
-ATTR_KEY_LAST_YEAR_BY_MONTH = "last_year_by_month"
-ATTR_KEY_LATEST_DAY_DATE = "latest_day_date"
+ATTR_KEY_SETTLEMENT_DATE = "settlement_date"
+ATTR_KEY_MONTH_BILLING_DELAY = "month_billing_delay"
+ATTR_KEY_YEAR_BILLING_DELAY = "year_billing_delay"
 ATTR_KEY_CURRENT_LADDER_START_DATE = "current_ladder_start_date"
 
-STATE_UPDATE_UNCHANGED = "unchanged"
-DATA_KEY_LAST_UPDATE_DAY = "last_update_day"
+STORAGE_KEY = f"{DOMAIN}.energy_ledger"
+STORAGE_VERSION = 1
 
 # settings
 

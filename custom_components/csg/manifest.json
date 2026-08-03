@@ -1,20 +1,21 @@
 {
-  "domain": "china_southern_power_grid_stat",
+  "domain": "csg",
   "name": "China Southern Power Grid Statistics",
   "codeowners": [
-    "@cubicpill"
+    "@orangeboyChen"
   ],
   "config_flow": true,
+  "integration_type": "service",
   "dependencies": [],
-  "documentation": "https://github.com/CubicPill/china_southern_power_grid_stat/",
+  "documentation": "https://github.com/orangeboyChen/ha-csg/",
   "homekit": {},
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/CubicPill/china_southern_power_grid_stat/issues",
+  "issue_tracker": "https://github.com/orangeboyChen/ha-csg/issues",
   "requirements": [
     "pycryptodome",
     "brotli"
   ],
   "ssdp": [],
-  "version": "1.2.0",
+  "version": "2.0.0",
   "zeroconf": []
 }
