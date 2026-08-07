@@ -288,6 +288,9 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         if user_input[CONF_REFRESH_QR_CODE]:
             return await self.async_step_qr_login()
+        if "login_id" not in self.context["user_data"]:
+            # A failed QR creation has no status to validate; retry generation.
+            return await self.async_step_qr_login()
         return await self.async_step_validate_qr_login()
 
     async def async_step_validate_qr_login(
@@ -296,6 +299,8 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Get QR scan status after user has scanned the code"""
         client: CSGClient = CSGClient()
         login_type = self.context["user_data"][CONF_LOGIN_TYPE]
+        if "login_id" not in self.context["user_data"]:
+            return await self.async_step_qr_login()
         login_id = self.context["user_data"]["login_id"]
         try:
             ok, auth_token = await self.hass.async_add_executor_job(

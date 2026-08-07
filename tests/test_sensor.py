@@ -112,6 +112,22 @@ def test_energy_total_advances_linearly_through_the_day() -> None:
     assert at_noon == 12
 
 
+def test_energy_total_does_not_interpolate_billing_only_day() -> None:
+    """A billing import without realtime contribution cannot lower the meter."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-07-31", 10))
+    run(
+        ledger.async_record_billing(
+            "account", [{"date": "2026-08-01", "kwh": 24, "charge": 5}]
+        )
+    )
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+
+    assert ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == 10
+
+
 def test_ledger_billing_correction_and_settlement_lock() -> None:
     """Billing changes are reported for Recorder and never double-count usage."""
     ledger = make_ledger()

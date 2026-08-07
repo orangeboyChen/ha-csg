@@ -155,10 +155,12 @@ class EnergyLedger:
                 await self._store.async_save(self._data)
                 return float(ledger.get("energy_total", 0))
             reported_days = ledger.setdefault("reported_realtime", {})
+            counted_days = ledger.setdefault("counted_realtime", {})
             reported = float(reported_days.get(day, 0))
             if value > reported:
                 ledger["energy_total"] = float(ledger.get("energy_total", 0)) + value - reported
                 reported_days[day] = value
+                counted_days[day] = value
             await self._store.async_save(self._data)
             return float(ledger.setdefault("energy_total", 0.0))
 
@@ -267,7 +269,12 @@ class EnergyLedger:
         if not realtime:
             return total
         latest_day = max(realtime)
-        latest_value = float(realtime[latest_day])
+        # Billing-only days are deliberately excluded from energy_total. Only
+        # interpolate a day whose realtime contribution is in the ledger total.
+        latest_value = self._account(account).get("counted_realtime", {}).get(latest_day)
+        if latest_value is None:
+            return total
+        latest_value = float(latest_value)
         local = when.astimezone(_CSG_TIME_ZONE)
         if local.date() != dt.date.fromisoformat(latest_day) + dt.timedelta(days=1):
             return total
