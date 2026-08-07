@@ -18,6 +18,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import selector
 from requests import RequestException
 
 from .const import (
@@ -25,6 +26,7 @@ from .const import (
     ABORT_NO_ACCOUNT,
     CONF_ACCOUNT_NUMBER,
     CONF_AUTH_TOKEN,
+    CONF_BILLING_UPDATE_TIME,
     CONF_ELE_ACCOUNTS,
     CONF_GENERAL_ERROR,
     CONF_LOGIN_TYPE,
@@ -34,6 +36,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     CONF_UPDATED_AT,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_BILLING_UPDATE_TIME,
     DOMAIN,
     ERROR_CANNOT_CONNECT,
     ERROR_INVALID_AUTH,
@@ -251,9 +254,29 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is None:
             # create QR code
             login_type = self.context["user_data"][CONF_LOGIN_TYPE]
-            login_id, image_link = await self.hass.async_add_executor_job(
-                client.api_create_login_qr_code, LOGIN_TYPE_TO_QR_CODE_TYPE[login_type]
-            )
+            try:
+                login_id, image_link = await self.hass.async_add_executor_job(
+                    client.api_create_login_qr_code,
+                    LOGIN_TYPE_TO_QR_CODE_TYPE[login_type],
+                )
+            except RequestException:
+                return self.async_show_form(
+                    step_id=STEP_QR_LOGIN,
+                    data_schema=vol.Schema(
+                        {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                    ),
+                    errors={CONF_GENERAL_ERROR: ERROR_CANNOT_CONNECT},
+                )
+            except Exception as err:
+                _LOGGER.exception("Unexpected exception when creating QR code")
+                return self.async_show_form(
+                    step_id=STEP_QR_LOGIN,
+                    data_schema=vol.Schema(
+                        {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                    ),
+                    errors={CONF_GENERAL_ERROR: ERROR_UNKNOWN},
+                    description_placeholders={"error_detail": str(err)},
+                )
             self.context["user_data"]["login_id"] = login_id
             self.context["user_data"]["image_link"] = image_link
             return self.async_show_form(
@@ -268,6 +291,9 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         if user_input[CONF_REFRESH_QR_CODE]:
             return await self.async_step_qr_login()
+        if "login_id" not in self.context["user_data"]:
+            # A failed QR creation has no status to validate; retry generation.
+            return await self.async_step_qr_login()
         return await self.async_step_validate_qr_login()
 
     async def async_step_validate_qr_login(
@@ -276,10 +302,39 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Get QR scan status after user has scanned the code"""
         client: CSGClient = CSGClient()
         login_type = self.context["user_data"][CONF_LOGIN_TYPE]
+        if "login_id" not in self.context["user_data"]:
+            return await self.async_step_qr_login()
         login_id = self.context["user_data"]["login_id"]
-        ok, auth_token = await self.hass.async_add_executor_job(
-            client.api_get_qr_login_status, login_id
-        )
+        try:
+            ok, auth_token = await self.hass.async_add_executor_job(
+                client.api_get_qr_login_status, login_id
+            )
+        except RequestException:
+            return self.async_show_form(
+                step_id=STEP_QR_LOGIN,
+                data_schema=vol.Schema(
+                    {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                ),
+                errors={CONF_GENERAL_ERROR: ERROR_CANNOT_CONNECT},
+                description_placeholders={
+                    "app_name": LOGIN_TYPE_TO_QR_APP_NAME[login_type],
+                    "image_link": self.context["user_data"]["image_link"],
+                },
+            )
+        except Exception as err:
+            _LOGGER.exception("Unexpected exception when checking QR code")
+            return self.async_show_form(
+                step_id=STEP_QR_LOGIN,
+                data_schema=vol.Schema(
+                    {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                ),
+                errors={CONF_GENERAL_ERROR: ERROR_UNKNOWN},
+                description_placeholders={
+                    "app_name": LOGIN_TYPE_TO_QR_APP_NAME[login_type],
+                    "image_link": self.context["user_data"]["image_link"],
+                    "error_detail": str(err),
+                },
+            )
         if ok:
             # for QR login, use mobile number as username
             client.set_authentication_params(auth_token)
@@ -319,7 +374,6 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         If the account is already added (reauth), update the existing entry"""
         data = {
             CONF_USERNAME: username,
-            CONF_PASSWORD: password,
             CONF_LOGIN_TYPE: login_type,
             CONF_AUTH_TOKEN: auth_token,
             CONF_ELE_ACCOUNTS: {},
@@ -482,11 +536,18 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Settings of parameters"""
         update_interval = self._entry.data[CONF_SETTINGS][CONF_UPDATE_INTERVAL]
+        billing_update_time = self._entry.data[CONF_SETTINGS].get(
+            CONF_BILLING_UPDATE_TIME, DEFAULT_BILLING_UPDATE_TIME
+        )
         schema = vol.Schema(
             {
                 vol.Required(CONF_UPDATE_INTERVAL, default=update_interval): vol.All(
                     int, vol.Range(min=60)
                 ),
+                vol.Required(
+                    CONF_BILLING_UPDATE_TIME,
+                    default=billing_update_time,
+                ): selector.TimeSelector(),
             }
         )
         if user_input is None:
@@ -497,6 +558,11 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
             CONF_SETTINGS: {
                 **self._entry.data[CONF_SETTINGS],
                 CONF_UPDATE_INTERVAL: user_input[CONF_UPDATE_INTERVAL],
+                CONF_BILLING_UPDATE_TIME: (
+                    user_input.get(CONF_BILLING_UPDATE_TIME, billing_update_time).isoformat()
+                    if hasattr(user_input.get(CONF_BILLING_UPDATE_TIME, billing_update_time), "isoformat")
+                    else user_input.get(CONF_BILLING_UPDATE_TIME, billing_update_time)
+                ),
             },
         }
         new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))

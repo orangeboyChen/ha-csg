@@ -244,7 +244,10 @@ class CSGClient:
             headers[HEADER_X_AUTH_TOKEN] = self.auth_token
             headers[HEADER_CUST_NUMBER] = self.customer_number
         if method == "POST":
-            response = self._session.post(url, json=payload, headers=headers)
+            # Keep blocking requests bounded; callers run this client in an executor.
+            response = self._session.post(
+                url, json=payload, headers=headers, timeout=(10, 60)
+            )
             if response.status_code != 200:
                 _LOGGER.error(
                     "API call %s returned status code %d", path, response.status_code

@@ -52,7 +52,7 @@
     "step": {
       "init": {"title": "Choose an action", "menu_options": {"add_account": "Add a linked payment account", "settings": "Settings"}},
       "add_account": {"title": "Choose a payment account"},
-      "settings": {"title": "Settings", "data": {"update_interval": "Update interval (seconds)"}}
+      "settings": {"title": "Settings", "data": {"update_interval": "Update interval (seconds)", "billing_update_time": "Daily billing update time"}}
     },
     "abort": {"no_account": "No payment account is linked to this CSG account", "all_added": "All linked payment accounts are already configured"}
   }

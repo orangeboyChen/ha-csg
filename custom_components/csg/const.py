@@ -14,6 +14,7 @@ CONF_AUTH_TOKEN = "auth_token"
 # electricity accounts
 CONF_ELE_ACCOUNTS = "accounts"
 CONF_UPDATE_INTERVAL = "update_interval"
+CONF_BILLING_UPDATE_TIME = "billing_update_time"
 CONF_SETTINGS = "settings"
 CONF_UPDATED_AT = "updated_at"
 CONF_ACTION = "action"
@@ -92,3 +93,4 @@ SETTING_LAST_YEAR_UPDATE_DAY_THRESHOLD = 7
 
 # defaults
 DEFAULT_UPDATE_INTERVAL = timedelta(hours=4).seconds
+DEFAULT_BILLING_UPDATE_TIME = "12:00:00"

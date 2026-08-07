@@ -52,7 +52,7 @@
     "step": {
       "init": {"title": "选择操作", "menu_options": {"add_account": "添加已绑定的缴费号", "settings": "参数设置"}},
       "add_account": {"title": "选择缴费号"},
-      "settings": {"title": "参数设置", "data": {"update_interval": "更新间隔（秒）"}}
+      "settings": {"title": "参数设置", "data": {"update_interval": "更新间隔（秒）", "billing_update_time": "每日账单更新时间"}}
     },
     "abort": {"no_account": "账户未绑定缴费号", "all_added": "没有可添加到此集成的缴费号"}
   }
