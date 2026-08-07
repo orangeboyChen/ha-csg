@@ -128,6 +128,17 @@ def test_energy_total_does_not_interpolate_billing_only_day() -> None:
     ) == 10
 
 
+def test_energy_total_uses_safe_legacy_realtime_marker() -> None:
+    """Pre-upgrade ledgers smooth unbilled days without trusting billing rows."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+    del ledger._data["accounts"]["account"]["counted_realtime"]
+
+    assert ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == 12
+
+
 def test_ledger_billing_correction_and_settlement_lock() -> None:
     """Billing changes are reported for Recorder and never double-count usage."""
     ledger = make_ledger()

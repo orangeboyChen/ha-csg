@@ -274,7 +274,12 @@ class EnergyLedger:
         latest_day = max(realtime)
         # Billing-only days are deliberately excluded from energy_total. Only
         # interpolate a day whose realtime contribution is in the ledger total.
-        latest_value = self._account(account).get("counted_realtime", {}).get(latest_day)
+        ledger = self._account(account)
+        latest_value = ledger.get("counted_realtime", {}).get(latest_day)
+        if latest_value is None and latest_day not in ledger.get("billing", {}):
+            # Ledgers from before counted_realtime only have this safe legacy
+            # marker when no bill has locked the day's realtime contribution.
+            latest_value = ledger.get("reported_realtime", {}).get(latest_day)
         if latest_value is None:
             return total
         latest_value = float(latest_value)
