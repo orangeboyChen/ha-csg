@@ -251,9 +251,29 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is None:
             # create QR code
             login_type = self.context["user_data"][CONF_LOGIN_TYPE]
-            login_id, image_link = await self.hass.async_add_executor_job(
-                client.api_create_login_qr_code, LOGIN_TYPE_TO_QR_CODE_TYPE[login_type]
-            )
+            try:
+                login_id, image_link = await self.hass.async_add_executor_job(
+                    client.api_create_login_qr_code,
+                    LOGIN_TYPE_TO_QR_CODE_TYPE[login_type],
+                )
+            except RequestException:
+                return self.async_show_form(
+                    step_id=STEP_QR_LOGIN,
+                    data_schema=vol.Schema(
+                        {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                    ),
+                    errors={CONF_GENERAL_ERROR: ERROR_CANNOT_CONNECT},
+                )
+            except Exception as err:
+                _LOGGER.exception("Unexpected exception when creating QR code")
+                return self.async_show_form(
+                    step_id=STEP_QR_LOGIN,
+                    data_schema=vol.Schema(
+                        {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                    ),
+                    errors={CONF_GENERAL_ERROR: ERROR_UNKNOWN},
+                    description_placeholders={"error_detail": str(err)},
+                )
             self.context["user_data"]["login_id"] = login_id
             self.context["user_data"]["image_link"] = image_link
             return self.async_show_form(
@@ -277,9 +297,28 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         client: CSGClient = CSGClient()
         login_type = self.context["user_data"][CONF_LOGIN_TYPE]
         login_id = self.context["user_data"]["login_id"]
-        ok, auth_token = await self.hass.async_add_executor_job(
-            client.api_get_qr_login_status, login_id
-        )
+        try:
+            ok, auth_token = await self.hass.async_add_executor_job(
+                client.api_get_qr_login_status, login_id
+            )
+        except RequestException:
+            return self.async_show_form(
+                step_id=STEP_QR_LOGIN,
+                data_schema=vol.Schema(
+                    {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                ),
+                errors={CONF_GENERAL_ERROR: ERROR_CANNOT_CONNECT},
+            )
+        except Exception as err:
+            _LOGGER.exception("Unexpected exception when checking QR code")
+            return self.async_show_form(
+                step_id=STEP_QR_LOGIN,
+                data_schema=vol.Schema(
+                    {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                ),
+                errors={CONF_GENERAL_ERROR: ERROR_UNKNOWN},
+                description_placeholders={"error_detail": str(err)},
+            )
         if ok:
             # for QR login, use mobile number as username
             client.set_authentication_params(auth_token)
@@ -319,7 +358,6 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         If the account is already added (reauth), update the existing entry"""
         data = {
             CONF_USERNAME: username,
-            CONF_PASSWORD: password,
             CONF_LOGIN_TYPE: login_type,
             CONF_AUTH_TOKEN: auth_token,
             CONF_ELE_ACCOUNTS: {},

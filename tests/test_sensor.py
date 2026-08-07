@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
@@ -93,6 +94,22 @@ def test_ledger_initializes_zero_totals() -> None:
     assert run(
         ledger.async_record_billing("account", [{"date": "2026-08-01", "kwh": 0}])
     )[0] == 0
+
+
+def test_energy_total_advances_linearly_through_the_day() -> None:
+    """The displayed cumulative value does not jump when the API is polled."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+
+    at_midnight = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    at_noon = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+
+    assert at_midnight == 0
+    assert at_noon == 12
 
 
 def test_ledger_billing_correction_and_settlement_lock() -> None:
@@ -292,6 +309,12 @@ class FakeBillingCoordinator:
     async def _add_year_data(self, client, account, data: dict) -> None:
         return None
 
+    def _notify_failure(self, account: str, kind: str, err: Exception) -> None:
+        return None
+
+    def _clear_failure(self, account: str, kind: str) -> None:
+        return None
+
 
 async def _call(function, *args):
     return function(*args)
@@ -330,6 +353,33 @@ def test_billing_coordinator_falls_back_to_last_month_settlement(monkeypatch) ->
     assert data[SUFFIX_LATEST_DAY_COST] == 2.0
     assert data[ATTR_KEY_SETTLEMENT_DATE] == {ATTR_KEY_SETTLEMENT_DATE: "2026-07-31"}
     assert data[SUFFIX_SETTLED_COST_TOTAL] == 5.0
+    assert coordinator.corrected == {}
+
+
+def test_billing_coordinator_applies_pending_corrections_with_daily_rows(monkeypatch) -> None:
+    """Normal bill refreshes submit corrections instead of dropping them."""
+    class CorrectingLedger(FakeLedger):
+        async def async_record_billing(self, account: str, days: list[dict]):
+            self.days = days
+            return 5.0, {"2026-07-31": ({"kwh": 1.0}, {"kwh": 2.0})}
+
+    coordinator = FakeBillingCoordinator()
+    coordinator.ledger = CorrectingLedger()
+    account = SimpleNamespace(account_number="account")
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.now",
+        lambda: SimpleNamespace(date=lambda: __import__("datetime").date(2026, 8, 3)),
+    )
+
+    run(
+        BillingCoordinator._update_account(
+            coordinator, FakeClient(), account, [(2026, 8), (2026, 7)]
+        )
+    )
+
+    assert coordinator.corrected == {
+        "2026-07-31": ({"kwh": 1.0}, {"kwh": 2.0})
+    }
 
 
 def test_billing_coordinator_marks_failed_month_unavailable(monkeypatch) -> None:

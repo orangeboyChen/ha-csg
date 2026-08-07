@@ -1,5 +1,7 @@
 # ha-csg
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Home Assistant custom integration for China Southern Power Grid electricity data.
 
 This project is a fork of [CubicPill/china_southern_power_grid_stat](https://github.com/CubicPill/china_southern_power_grid_stat).
@@ -50,7 +52,9 @@ for a continuously increasing meter.
 
 ## Energy dashboard and billing corrections
 
-Energy total advances from the realtime yesterday-usage API. When the delayed
+Energy total advances smoothly through the current day using the latest complete
+daily reading as its rate. The ledger remains based on complete daily readings,
+so this interpolation is only for the live entity value. When the delayed
 daily bill becomes available, the integration compares its `result[].power` and
 `result[].charge` values with stored data and corrects existing Home Assistant
 Recorder statistics for that date.

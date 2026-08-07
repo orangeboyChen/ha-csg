@@ -8,7 +8,8 @@ import time
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from requests import RequestException
 from homeassistant.helpers import entity_registry
 from homeassistant.helpers.device_registry import DeviceEntry
 
@@ -40,7 +41,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_AUTH_TOKEN: entry.data[CONF_AUTH_TOKEN],
         }
     )
-    if not await hass.async_add_executor_job(client.verify_login):
+    try:
+        logged_in = await hass.async_add_executor_job(client.verify_login)
+    except (CSGAPIError, RequestException) as err:
+        raise ConfigEntryNotReady(f"Unable to contact China Southern Power Grid: {err}") from err
+    if not logged_in:
         raise ConfigEntryAuthFailed("Login expired")
 
     hass.data[DOMAIN][entry.entry_id] = {}
@@ -55,8 +60,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug(f"Unloading entry: {entry.title}")
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     _LOGGER.debug(f"Unload platforms for entry: {entry.title}, success: {unload_ok}")
-    hass.data[DOMAIN].pop(entry.entry_id)
-    return True
+    hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok
 
 
 async def async_remove_config_entry_device(

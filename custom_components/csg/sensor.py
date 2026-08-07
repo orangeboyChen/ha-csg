@@ -11,7 +11,6 @@ from datetime import timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import async_timeout
 import requests
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
@@ -22,8 +21,13 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
+from homeassistant.components import persistent_notification
 from homeassistant.util import dt as dt_util
-from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 
 from .const import (
     ATTR_KEY_CURRENT_LADDER_START_DATE,
@@ -249,6 +253,29 @@ class EnergyLedger:
         value = self._account(account).get("energy_total")
         return float(value) if value is not None else None
 
+    def energy_total_at(self, account: str, when: dt.datetime) -> float | None:
+        """Estimate today's cumulative value from the latest complete day.
+
+        The API reports complete daily totals. The exposed sensor advances that
+        latest total linearly during the following day while keeping the ledger
+        itself authoritative for Recorder corrections.
+        """
+        total = self.energy_total(account)
+        if total is None:
+            return None
+        realtime = self._account(account).get("realtime", {})
+        if not realtime:
+            return total
+        latest_day = max(realtime)
+        latest_value = float(realtime[latest_day])
+        local = when.astimezone(_CSG_TIME_ZONE)
+        if local.date() != dt.date.fromisoformat(latest_day) + dt.timedelta(days=1):
+            return total
+        fraction = (
+            local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1e6
+        ) / 86400
+        return max(0.0, total - latest_value + latest_value * fraction)
+
     def _account(self, account: str) -> dict[str, Any]:
         return self._data["accounts"].setdefault(account, {})
 
@@ -320,6 +347,10 @@ class CSGSensor(CoordinatorEntity, SensorEntity):
         value = (self.coordinator.data or {}).get(self._account, {}).get(self._description.suffix)
         self._value_present = value is not None and value != STATE_UNAVAILABLE
         if self._value_present:
+            if self._description.suffix == SUFFIX_ENERGY_TOTAL:
+                ledger = getattr(self.coordinator, "ledger", None)
+                if ledger is not None:
+                    value = ledger.energy_total_at(self._account, dt_util.utcnow())
             self._attr_native_value = value
             self._attr_extra_state_attributes = (
                 self.coordinator.data[self._account].get(self._attributes_key, {})
@@ -347,18 +378,42 @@ class CSGCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         )
 
     async def _client(self) -> CSGClient:
-        client = await self.hass.async_add_executor_job(CSGClient.load, {CONF_AUTH_TOKEN: self.entry.data[CONF_AUTH_TOKEN]})
-        if not await self.hass.async_add_executor_job(client.verify_login):
-            raise ConfigEntryAuthFailed("Login expired")
-        await self.hass.async_add_executor_job(client.initialize)
+        try:
+            client = await self.hass.async_add_executor_job(
+                CSGClient.load, {CONF_AUTH_TOKEN: self.entry.data[CONF_AUTH_TOKEN]}
+            )
+            if not await self.hass.async_add_executor_job(client.verify_login):
+                raise ConfigEntryAuthFailed("Login expired")
+            await self.hass.async_add_executor_job(client.initialize)
+        except ConfigEntryAuthFailed:
+            raise
+        except FETCH_EXCEPTIONS as err:
+            self._notify_failure("all", "connection", err)
+            raise UpdateFailed(f"Unable to initialize CSG client: {err}") from err
+        self._clear_failure("all", "connection")
         return client
 
     async def _fetch(self, function: Any, *args: Any) -> Any:
-        async with async_timeout.timeout(SETTING_UPDATE_TIMEOUT):
+        async with asyncio.timeout(SETTING_UPDATE_TIMEOUT):
             return await self.hass.async_add_executor_job(function, *args)
 
     def _accounts(self) -> Iterable[CSGElectricityAccount]:
         return (CSGElectricityAccount.load(value) for value in self.entry.data[CONF_ELE_ACCOUNTS].values())
+
+    def _notify_failure(self, account: str, kind: str, err: Exception) -> None:
+        """Make transient cloud failures visible without discarding all entities."""
+        persistent_notification.async_create(
+            self.hass,
+            f"CSG {kind} request for account {account} failed: {err}",
+            title="China Southern Power Grid update failed",
+            notification_id=f"{DOMAIN}_{self.entry.entry_id}_{kind}_{account}",
+        )
+
+    def _clear_failure(self, account: str, kind: str) -> None:
+        persistent_notification.async_dismiss(
+            self.hass,
+            f"{DOMAIN}_{self.entry.entry_id}_{kind}_{account}",
+        )
 
 
 class RealtimeCoordinator(CSGCoordinator):
@@ -376,15 +431,18 @@ class RealtimeCoordinator(CSGCoordinator):
             try:
                 balance, arrears = await self._fetch(client.get_balance_and_arrears, account)
                 account_data.update({SUFFIX_BAL: balance, SUFFIX_ARR: arrears})
+                self._clear_failure(account.account_number, "balance")
             except FETCH_EXCEPTIONS as err:
                 _LOGGER.warning("Could not update balance for %s: %s", account.account_number, err)
                 account_data.update({SUFFIX_BAL: STATE_UNAVAILABLE, SUFFIX_ARR: STATE_UNAVAILABLE})
+                self._notify_failure(account.account_number, "balance", err)
             try:
                 usage = await self._fetch(client.get_yesterday_kwh, account)
                 if usage is None:
                     raise ValueError("Yesterday usage is empty")
                 account_data[SUFFIX_YESTERDAY_KWH] = usage
                 account_data[SUFFIX_ENERGY_TOTAL] = await self.ledger.async_record_realtime(account.account_number, yesterday, usage)
+                self._clear_failure(account.account_number, "usage")
             except FETCH_EXCEPTIONS as err:
                 _LOGGER.warning("Could not update yesterday usage for %s: %s", account.account_number, err)
                 account_data[SUFFIX_YESTERDAY_KWH] = STATE_UNAVAILABLE
@@ -392,6 +450,7 @@ class RealtimeCoordinator(CSGCoordinator):
                 account_data[SUFFIX_ENERGY_TOTAL] = (
                     energy_total if energy_total is not None else STATE_UNAVAILABLE
                 )
+                self._notify_failure(account.account_number, "usage", err)
             data[account.account_number] = account_data
         return data
 
@@ -414,6 +473,7 @@ class CurrentCoordinator(CSGCoordinator):
                     (today.year, today.month),
                 )
                 data[account.account_number] = _ladder_data(ladder)
+                self._clear_failure(account.account_number, "ladder")
             except FETCH_EXCEPTIONS as err:
                 _LOGGER.warning("Could not update ladder for %s: %s", account.account_number, err)
                 data[account.account_number] = {
@@ -424,6 +484,7 @@ class CurrentCoordinator(CSGCoordinator):
                         SUFFIX_CURRENT_LADDER_TARIFF,
                     )
                 }
+                self._notify_failure(account.account_number, "ladder", err)
         return data
 
 
@@ -450,6 +511,7 @@ class BillingCoordinator(CSGCoordinator):
         daily: list[dict[str, float | str]] = []
         current_month = None
         last_month = None
+        billing_failed = False
         for year, month in months:
             try:
                 usage_total, usage_days = await self._fetch(client.get_month_daily_usage_detail, account, (year, month))
@@ -463,6 +525,10 @@ class BillingCoordinator(CSGCoordinator):
                     last_month = values
             except FETCH_EXCEPTIONS as err:
                 _LOGGER.warning("Could not update billing for %s/%s-%02d: %s", account.account_number, year, month, err)
+                billing_failed = True
+                self._notify_failure(account.account_number, "billing", err)
+        if not billing_failed:
+            self._clear_failure(account.account_number, "billing")
         has_current_settlement_day = False
         if current_month:
             usage_total, cost_total, ladder, current_days = current_month
@@ -484,13 +550,14 @@ class BillingCoordinator(CSGCoordinator):
             data[SUFFIX_SETTLED_COST_TOTAL] = total_cost
         else:
             data[SUFFIX_SETTLED_COST_TOTAL] = STATE_UNAVAILABLE
-            acknowledgements = await self._async_correct_statistics(
-                account.account_number, changed_days
+        # Corrections are independent of whether this refresh returned rows.
+        acknowledgements = await self._async_correct_statistics(
+            account.account_number, changed_days
+        )
+        if acknowledgements:
+            await self.ledger.async_acknowledge_corrections(
+                account.account_number, acknowledgements
             )
-            if acknowledgements:
-                await self.ledger.async_acknowledge_corrections(
-                    account.account_number, acknowledgements
-                )
         await self._add_year_data(client, account, data)
         return data
 
