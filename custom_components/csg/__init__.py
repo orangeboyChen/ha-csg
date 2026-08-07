@@ -58,6 +58,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug(f"Unloading entry: {entry.title}")
+    billing = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("billing_coordinator")
+    if billing is not None:
+        await billing.async_shutdown()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     _LOGGER.debug(f"Unload platforms for entry: {entry.title}, success: {unload_ok}")
     hass.data[DOMAIN].pop(entry.entry_id, None)

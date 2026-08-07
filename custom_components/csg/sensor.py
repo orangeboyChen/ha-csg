@@ -20,7 +20,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.components import persistent_notification
 from homeassistant.util import dt as dt_util
@@ -36,6 +36,7 @@ from .const import (
     ATTR_KEY_SETTLEMENT_DATE,
     ATTR_KEY_YEAR_BILLING_DELAY,
     CONF_AUTH_TOKEN,
+    CONF_BILLING_UPDATE_TIME,
     CONF_ELE_ACCOUNTS,
     CONF_SETTINGS,
     CONF_UPDATE_INTERVAL,
@@ -43,6 +44,7 @@ from .const import (
     SETTING_UPDATE_TIMEOUT,
     STORAGE_KEY,
     STORAGE_VERSION,
+    DEFAULT_BILLING_UPDATE_TIME,
     SUFFIX_ARR,
     SUFFIX_BAL,
     SUFFIX_CURRENT_LADDER,
@@ -297,9 +299,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     realtime = RealtimeCoordinator(hass, entry, ledger)
     current = CurrentCoordinator(hass, entry, ledger)
     billing = BillingCoordinator(hass, entry, ledger)
+    hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})[
+        "billing_coordinator"
+    ] = billing
     await realtime.async_refresh()
     await current.async_refresh()
     await billing.async_refresh()
+    billing.start_daily_refresh()
     entities: list[CSGSensor] = []
     for account in entry.data[CONF_ELE_ACCOUNTS]:
         entities.extend(
@@ -524,7 +530,36 @@ class BillingCoordinator(CSGCoordinator):
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, ledger: EnergyLedger) -> None:
         super().__init__(hass, entry, ledger, f"CSG billing {entry.data[CONF_USERNAME]}")
-        self.update_interval = timedelta(days=1)
+        self.update_interval = None
+        update_time = dt.time.fromisoformat(
+            entry.data[CONF_SETTINGS].get(
+                CONF_BILLING_UPDATE_TIME, DEFAULT_BILLING_UPDATE_TIME
+            )
+        )
+        self._billing_update_time = update_time
+        self._unsub_daily_refresh = None
+
+    def start_daily_refresh(self) -> None:
+        """Register the fixed-time callback after the initial refresh succeeds."""
+        if self._unsub_daily_refresh is None:
+            self._unsub_daily_refresh = async_track_time_change(
+                self.hass,
+                self._handle_daily_refresh,
+                hour=self._billing_update_time.hour,
+                minute=self._billing_update_time.minute,
+                second=self._billing_update_time.second,
+            )
+
+    async def _handle_daily_refresh(self, _now: dt.datetime) -> None:
+        """Refresh delayed billing data at noon in Home Assistant's timezone."""
+        await self.async_refresh()
+
+    async def async_shutdown(self) -> None:
+        """Cancel the fixed-time billing refresh callback."""
+        if self._unsub_daily_refresh:
+            self._unsub_daily_refresh()
+            self._unsub_daily_refresh = None
+        await super().async_shutdown()
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         client = await self._client()

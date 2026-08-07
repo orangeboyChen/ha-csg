@@ -18,6 +18,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import selector
 from requests import RequestException
 
 from .const import (
@@ -25,6 +26,7 @@ from .const import (
     ABORT_NO_ACCOUNT,
     CONF_ACCOUNT_NUMBER,
     CONF_AUTH_TOKEN,
+    CONF_BILLING_UPDATE_TIME,
     CONF_ELE_ACCOUNTS,
     CONF_GENERAL_ERROR,
     CONF_LOGIN_TYPE,
@@ -34,6 +36,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     CONF_UPDATED_AT,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_BILLING_UPDATE_TIME,
     DOMAIN,
     ERROR_CANNOT_CONNECT,
     ERROR_INVALID_AUTH,
@@ -533,11 +536,18 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Settings of parameters"""
         update_interval = self._entry.data[CONF_SETTINGS][CONF_UPDATE_INTERVAL]
+        billing_update_time = self._entry.data[CONF_SETTINGS].get(
+            CONF_BILLING_UPDATE_TIME, DEFAULT_BILLING_UPDATE_TIME
+        )
         schema = vol.Schema(
             {
                 vol.Required(CONF_UPDATE_INTERVAL, default=update_interval): vol.All(
                     int, vol.Range(min=60)
                 ),
+                vol.Required(
+                    CONF_BILLING_UPDATE_TIME,
+                    default=billing_update_time,
+                ): selector.TimeSelector(),
             }
         )
         if user_input is None:
@@ -548,6 +558,11 @@ class CSGOptionsFlowHandler(config_entries.OptionsFlow):
             CONF_SETTINGS: {
                 **self._entry.data[CONF_SETTINGS],
                 CONF_UPDATE_INTERVAL: user_input[CONF_UPDATE_INTERVAL],
+                CONF_BILLING_UPDATE_TIME: (
+                    user_input.get(CONF_BILLING_UPDATE_TIME, billing_update_time).isoformat()
+                    if hasattr(user_input.get(CONF_BILLING_UPDATE_TIME, billing_update_time), "isoformat")
+                    else user_input.get(CONF_BILLING_UPDATE_TIME, billing_update_time)
+                ),
             },
         }
         new_data[CONF_UPDATED_AT] = str(int(time.time() * 1000))
