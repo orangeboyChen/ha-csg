@@ -313,6 +313,10 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
                 ),
                 errors={CONF_GENERAL_ERROR: ERROR_CANNOT_CONNECT},
+                description_placeholders={
+                    "app_name": LOGIN_TYPE_TO_QR_APP_NAME[login_type],
+                    "image_link": self.context["user_data"]["image_link"],
+                },
             )
         except Exception as err:
             _LOGGER.exception("Unexpected exception when checking QR code")
@@ -322,7 +326,11 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
                 ),
                 errors={CONF_GENERAL_ERROR: ERROR_UNKNOWN},
-                description_placeholders={"error_detail": str(err)},
+                description_placeholders={
+                    "app_name": LOGIN_TYPE_TO_QR_APP_NAME[login_type],
+                    "image_link": self.context["user_data"]["image_link"],
+                    "error_detail": str(err),
+                },
             )
         if ok:
             # for QR login, use mobile number as username

@@ -20,6 +20,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.components import persistent_notification
 from homeassistant.util import dt as dt_util
@@ -328,7 +329,30 @@ class CSGSensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = description.icon
         self._attributes_key = description.attributes_key
         self._value_present = False
+        self._unsub_interpolation = None
         self._update_from_coordinator()
+
+    async def async_added_to_hass(self) -> None:
+        """Refresh interpolated energy state between cloud polls."""
+        await super().async_added_to_hass()
+        if self._description.suffix == SUFFIX_ENERGY_TOTAL:
+            self._unsub_interpolation = async_track_time_interval(
+                self.hass, self._handle_interpolation_tick, timedelta(minutes=5)
+            )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop the interpolation timer when the entity is removed."""
+        if self._unsub_interpolation:
+            self._unsub_interpolation()
+            self._unsub_interpolation = None
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _handle_interpolation_tick(self, _now: dt.datetime) -> None:
+        """Write the estimated cumulative value without making an API call."""
+        if self._description.suffix == SUFFIX_ENERGY_TOTAL:
+            self._update_from_coordinator()
+            self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:

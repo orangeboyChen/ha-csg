@@ -230,6 +230,27 @@ def test_sensor_uses_initial_coordinator_data_and_clears_missing_values() -> Non
     assert not sensor.available
 
 
+def test_energy_sensor_interpolation_tick_writes_a_new_state(monkeypatch) -> None:
+    """The energy entity refreshes its estimated value between cloud polls."""
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+    now = dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr("custom_components.csg.sensor.dt_util.utcnow", lambda: now)
+    coordinator = SimpleNamespace(
+        data={"account": {SUFFIX_ENERGY_TOTAL: 24}},
+        last_update_success=True,
+        ledger=ledger,
+    )
+    sensor = CSGSensor(coordinator, "account", ENERGY_TOTAL)
+    writes: list[bool] = []
+    sensor.async_write_ha_state = lambda: writes.append(True)
+
+    sensor._handle_interpolation_tick(now)
+
+    assert sensor.native_value == 12
+    assert writes == [True]
+
+
 def test_csg_today_uses_china_standard_time(monkeypatch) -> None:
     """CSG API dates must not depend on Home Assistant's configured timezone."""
     monkeypatch.setattr(
