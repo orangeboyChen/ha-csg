@@ -142,6 +142,81 @@ def test_energy_total_uses_safe_legacy_realtime_marker() -> None:
     ) == 12
 
 
+def freeze_utcnow(monkeypatch, moment: dt.datetime) -> None:
+    """Pin the ledger's clock so a recorded reading has a known arrival time."""
+    monkeypatch.setattr("custom_components.csg.sensor.dt_util.utcnow", lambda: moment)
+
+
+def test_energy_ramp_starts_when_the_reading_arrives(monkeypatch) -> None:
+    """The first poll after a reading pays out only the time since it arrived.
+
+    The ramp used to start at midnight, so a total published at 10:00 handed
+    back ten hours of usage in the single update that delivered it: the flat
+    line, wall, slow rise shape on the energy dashboard.
+    """
+    ledger = make_ledger()
+    # 2026-08-02 10:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 2, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+
+    at_arrival = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    at_seventeen = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 17, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    at_end_of_day = ledger.energy_total_at(
+        "account",
+        dt.datetime(2026, 8, 2, 23, 59, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    # Nothing is paid out for the ten hours that elapsed before the reading.
+    assert at_arrival == 0
+    assert at_seventeen == pytest.approx(12)
+    # The ledger's cumulative total is still reached by the end of the ramp day.
+    assert at_end_of_day == pytest.approx(24, abs=0.01)
+    assert (
+        ledger.energy_total_at(
+            "account", dt.datetime(2026, 8, 3, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+        == 24
+    )
+
+
+def test_energy_ramp_keeps_its_anchor_when_a_reading_is_revised(monkeypatch) -> None:
+    """A revision must not move the ramp start and step the total backwards."""
+    ledger = make_ledger()
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 2, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+    anchor = ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"]
+
+    # 2026-08-02 16:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 8, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 30))
+
+    assert ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"] == anchor
+    assert (
+        ledger.energy_total_at(
+            "account", dt.datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+        == 0
+    )
+    assert ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == pytest.approx(30 * 6 / 14)
+
+
+def test_energy_ramp_ignores_an_anchor_outside_the_ramp_day(monkeypatch) -> None:
+    """An arrival timestamp from another day cannot shorten the ramp."""
+    ledger = make_ledger()
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 1, 2, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+
+    assert ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == 12
+
+
 def test_ledger_billing_correction_and_settlement_lock() -> None:
     """Billing changes are reported for Recorder and never double-count usage."""
     ledger = make_ledger()
@@ -671,6 +746,27 @@ def test_realtime_coordinator_records_a_published_yesterday_reading(monkeypatch,
     assert created == []
     assert warning_messages(caplog) == []
     assert notification_ids("usage", dismissed) == ["csg_entry_usage_account"]
+
+
+def test_realtime_coordinator_leaves_energy_unavailable_when_a_failed_request_has_no_total(
+    monkeypatch, caplog
+) -> None:
+    """A failed request with nothing recorded yet has no total to expose."""
+    caplog.set_level(logging.DEBUG)
+    created, dismissed = capture_notifications(monkeypatch)
+    ledger = make_ledger()
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    coordinator = make_realtime_coordinator(ledger, FakeUsageClient(CSGAPIError("boom")))
+
+    data = run(coordinator._async_update_data())
+
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == STATE_UNAVAILABLE
+    assert notification_ids("usage", created) == ["csg_entry_usage_account"]
+    assert notification_ids("usage", dismissed) == []
 
 
 class FakeRealtimeClient:
