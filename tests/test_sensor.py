@@ -671,3 +671,88 @@ def test_realtime_coordinator_records_a_published_yesterday_reading(monkeypatch,
     assert created == []
     assert warning_messages(caplog) == []
     assert notification_ids("usage", dismissed) == ["csg_entry_usage_account"]
+
+
+class FakeRealtimeClient:
+    """Serve yesterday's reading, or raise, without network I/O."""
+
+    def __init__(self, usage: float | None = None, error: Exception | None = None) -> None:
+        self.usage = usage
+        self.error = error
+
+    def get_balance_and_arrears(self, account):
+        return 1.0, 0.0
+
+    def get_yesterday_kwh(self, account):
+        if self.error is not None:
+            raise self.error
+        return self.usage
+
+
+class FakeRealtimeCoordinator(RealtimeCoordinator):
+    """Small collaborator for testing RealtimeCoordinator._async_update_data.
+
+    Only the collaborators are replaced, so the helpers under test stay real.
+    """
+
+    def __init__(self, client: FakeRealtimeClient) -> None:
+        self.client = client
+        self.ledger = make_ledger()
+        self.notifications: list[tuple[str, str, Exception]] = []
+        self.dismissed: list[tuple[str, str]] = []
+
+    async def _client(self):
+        return self.client
+
+    def _accounts(self):
+        return [SimpleNamespace(account_number="account")]
+
+    async def _fetch(self, function, *args):
+        return function(*args)
+
+    def _notify_failure(self, account: str, kind: str, err: Exception) -> None:
+        self.notifications.append((account, kind, err))
+
+    def _clear_failure(self, account: str, kind: str) -> None:
+        self.dismissed.append((account, kind))
+
+
+def _patch_utcnow(monkeypatch) -> None:
+    """Pin the coordinator's clock so "yesterday" is a fixed day."""
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 3, 4, tzinfo=dt.UTC),
+    )
+
+
+def test_empty_yesterday_usage_is_not_a_failed_request(monkeypatch, caplog) -> None:
+    """An unpublished yesterday total is a data gap, not a broken account."""
+    caplog.set_level(logging.DEBUG)
+    _patch_utcnow(monkeypatch)
+    coordinator = FakeRealtimeCoordinator(FakeRealtimeClient(usage=None))
+    run(coordinator.ledger.async_record_realtime("account", "2026-08-01", 12))
+
+    data = run(RealtimeCoordinator._async_update_data(coordinator))
+
+    assert coordinator.notifications == []
+    assert ("account", "usage") in coordinator.dismissed
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == 12.0
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+    assert "not published yet" in "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+
+
+def test_failed_yesterday_usage_request_still_notifies(monkeypatch) -> None:
+    """A real yesterday request failure still reports the account as failing."""
+    _patch_utcnow(monkeypatch)
+    error = CSGAPIError("boom")
+    coordinator = FakeRealtimeCoordinator(FakeRealtimeClient(error=error))
+
+    data = run(RealtimeCoordinator._async_update_data(coordinator))
+
+    assert coordinator.notifications == [("account", "usage", error)]
+    assert ("account", "usage") not in coordinator.dismissed
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == STATE_UNAVAILABLE
