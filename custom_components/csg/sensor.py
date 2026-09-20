@@ -164,6 +164,13 @@ class EnergyLedger:
                 ledger["energy_total"] = float(ledger.get("energy_total", 0)) + value - reported
                 reported_days[day] = value
                 counted_days[day] = value
+                # The ramp starts when the reading arrives. Revisions keep the
+                # original anchor because moving it would step the exposed total
+                # backwards, and a drop on a total increasing sensor is booked as
+                # a meter reset.
+                ledger.setdefault("counted_at", {}).setdefault(
+                    day, dt_util.utcnow().isoformat()
+                )
             await self._store.async_save(self._data)
             return float(ledger.setdefault("energy_total", 0.0))
 
@@ -286,9 +293,7 @@ class EnergyLedger:
         local = when.astimezone(_CSG_TIME_ZONE)
         if local.date() != dt.date.fromisoformat(latest_day) + dt.timedelta(days=1):
             return total
-        fraction = (
-            local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1e6
-        ) / 86400
+        fraction = _ramp_fraction(ledger, latest_day, local)
         return max(0.0, total - latest_value + latest_value * fraction)
 
     def _account(self, account: str) -> dict[str, Any]:
@@ -464,6 +469,20 @@ class RealtimeCoordinator(CSGCoordinator):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, ledger: EnergyLedger) -> None:
         super().__init__(hass, entry, ledger, f"CSG realtime {entry.data[CONF_USERNAME]}")
 
+    def _ledger_total(self, account: str) -> Any:
+        """Return the ledger's running total, or unavailable without one."""
+        total = self.ledger.energy_total(account)
+        return total if total is not None else STATE_UNAVAILABLE
+
+    def _mark_yesterday_unavailable(self, account_data: dict[str, Any], account: str) -> None:
+        """Hide yesterday's usage while the energy meter keeps its total.
+
+        Shared by an unpublished reading and a failed request: the snapshot is
+        unknown either way, but only the request failure is reported.
+        """
+        account_data[SUFFIX_YESTERDAY_KWH] = STATE_UNAVAILABLE
+        account_data[SUFFIX_ENERGY_TOTAL] = self._ledger_total(account)
+
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         client = await self._client()
         data: dict[str, dict[str, Any]] = {}
@@ -480,19 +499,24 @@ class RealtimeCoordinator(CSGCoordinator):
                 self._notify_failure(account.account_number, "balance", err)
             try:
                 usage = await self._fetch(client.get_yesterday_kwh, account)
-                if usage is None:
-                    raise ValueError("Yesterday usage is empty")
-                account_data[SUFFIX_YESTERDAY_KWH] = usage
-                account_data[SUFFIX_ENERGY_TOTAL] = await self.ledger.async_record_realtime(account.account_number, yesterday, usage)
-                self._clear_failure(account.account_number, "usage")
             except FETCH_EXCEPTIONS as err:
                 _LOGGER.warning("Could not update yesterday usage for %s: %s", account.account_number, err)
-                account_data[SUFFIX_YESTERDAY_KWH] = STATE_UNAVAILABLE
-                energy_total = self.ledger.energy_total(account.account_number)
-                account_data[SUFFIX_ENERGY_TOTAL] = (
-                    energy_total if energy_total is not None else STATE_UNAVAILABLE
-                )
+                self._mark_yesterday_unavailable(account_data, account.account_number)
                 self._notify_failure(account.account_number, "usage", err)
+            else:
+                # An empty reading means the meter has not published yesterday's
+                # total yet. The request itself succeeded, so this is a gap in
+                # the data and not a failure: stay quiet and keep the ledger's
+                # running total instead of reporting the account as broken.
+                if usage is None:
+                    _LOGGER.debug("Yesterday usage for %s is not published yet", account.account_number)
+                    self._mark_yesterday_unavailable(account_data, account.account_number)
+                else:
+                    account_data[SUFFIX_YESTERDAY_KWH] = usage
+                    account_data[SUFFIX_ENERGY_TOTAL] = await self.ledger.async_record_realtime(
+                        account.account_number, yesterday, usage
+                    )
+                self._clear_failure(account.account_number, "usage")
             data[account.account_number] = account_data
         return data
 
@@ -714,6 +738,27 @@ def _merge_daily_days(usage_days: list[dict[str, Any]], cost_days: list[dict[str
 def _csg_today() -> dt.date:
     """Return the current calendar date used by the CSG API."""
     return dt_util.utcnow().astimezone(_CSG_TIME_ZONE).date()
+
+
+def _ramp_fraction(ledger: dict[str, Any], day: str, local: dt.datetime) -> float:
+    """Return how much of a day's reading has been smoothed out by `local`.
+
+    A complete day total only exists once the API publishes it, so the ramp
+    starts when the reading arrives instead of at midnight. Anchoring it at
+    midnight would pay out the whole elapsed share of the day in the single
+    update that delivers the reading.
+    """
+    start = dt.datetime.combine(local.date(), dt.time(0), tzinfo=_CSG_TIME_ZONE)
+    end = start + dt.timedelta(days=1)
+    started_at = ledger.get("counted_at", {}).get(day)
+    if started_at:
+        candidate = dt.datetime.fromisoformat(started_at).astimezone(_CSG_TIME_ZONE)
+        if start <= candidate < end:
+            start = candidate
+    span = (end - start).total_seconds()
+    if span <= 0:
+        return 1.0
+    return min(1.0, max(0.0, (local - start).total_seconds() / span))
 
 
 def _ladder_data(ladder: dict[str, Any]) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ from custom_components.csg.const import (
     SUFFIX_LATEST_DAY_COST,
     SUFFIX_LATEST_DAY_KWH,
     SUFFIX_SETTLED_COST_TOTAL,
+    SUFFIX_YESTERDAY_KWH,
 )
 from custom_components.csg.csg_client import CSGAPIError
 from custom_components.csg.sensor import (
@@ -28,6 +30,7 @@ from custom_components.csg.sensor import (
     BillingCoordinator,
     CSGSensor,
     EnergyLedger,
+    RealtimeCoordinator,
     _csg_today,
     _ladder_data,
     _merge_daily_days,
@@ -133,6 +136,81 @@ def test_energy_total_uses_safe_legacy_realtime_marker() -> None:
     ledger = make_ledger()
     run(ledger.async_record_realtime("account", "2026-08-01", 24))
     del ledger._data["accounts"]["account"]["counted_realtime"]
+
+    assert ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == 12
+
+
+def freeze_utcnow(monkeypatch, moment: dt.datetime) -> None:
+    """Pin the ledger's clock so a recorded reading has a known arrival time."""
+    monkeypatch.setattr("custom_components.csg.sensor.dt_util.utcnow", lambda: moment)
+
+
+def test_energy_ramp_starts_when_the_reading_arrives(monkeypatch) -> None:
+    """The first poll after a reading pays out only the time since it arrived.
+
+    The ramp used to start at midnight, so a total published at 10:00 handed
+    back ten hours of usage in the single update that delivered it: the flat
+    line, wall, slow rise shape on the energy dashboard.
+    """
+    ledger = make_ledger()
+    # 2026-08-02 10:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 2, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+
+    at_arrival = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    at_seventeen = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 17, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    at_end_of_day = ledger.energy_total_at(
+        "account",
+        dt.datetime(2026, 8, 2, 23, 59, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    # Nothing is paid out for the ten hours that elapsed before the reading.
+    assert at_arrival == 0
+    assert at_seventeen == pytest.approx(12)
+    # The ledger's cumulative total is still reached by the end of the ramp day.
+    assert at_end_of_day == pytest.approx(24, abs=0.01)
+    assert (
+        ledger.energy_total_at(
+            "account", dt.datetime(2026, 8, 3, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+        == 24
+    )
+
+
+def test_energy_ramp_keeps_its_anchor_when_a_reading_is_revised(monkeypatch) -> None:
+    """A revision must not move the ramp start and step the total backwards."""
+    ledger = make_ledger()
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 2, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
+    anchor = ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"]
+
+    # 2026-08-02 16:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 8, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 30))
+
+    assert ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"] == anchor
+    assert (
+        ledger.energy_total_at(
+            "account", dt.datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+        == 0
+    )
+    assert ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == pytest.approx(30 * 6 / 14)
+
+
+def test_energy_ramp_ignores_an_anchor_outside_the_ramp_day(monkeypatch) -> None:
+    """An arrival timestamp from another day cannot shorten the ramp."""
+    ledger = make_ledger()
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 1, 2, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
 
     assert ledger.energy_total_at(
         "account", dt.datetime(2026, 8, 2, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -499,3 +577,278 @@ def test_billing_correction_adjusts_existing_energy_and_cost_statistics(
         ("sensor.settled_cost_total", 1.5, "CNY"),
     ]
     assert all(start.date() == dt.date(2026, 8, 1) for _, start, _, _ in adjustments)
+
+
+class FakeUsageClient:
+    """Serve yesterday's reading, or raise, without network I/O."""
+
+    def __init__(self, usage: float | None | Exception) -> None:
+        self.usage = usage
+
+    def get_balance_and_arrears(self, account):
+        return 1.0, 0.0
+
+    def get_yesterday_kwh(self, account):
+        if isinstance(self.usage, Exception):
+            raise self.usage
+        return self.usage
+
+
+def make_realtime_coordinator(ledger: EnergyLedger, client: FakeUsageClient):
+    """Drive RealtimeCoordinator._async_update_data without Home Assistant."""
+    coordinator = RealtimeCoordinator.__new__(RealtimeCoordinator)
+    coordinator.hass = object()
+    coordinator.entry = SimpleNamespace(entry_id="entry")
+    coordinator.ledger = ledger
+
+    async def _client():
+        return client
+
+    async def _fetch(function, *args):
+        return function(*args)
+
+    coordinator._client = _client
+    coordinator._fetch = _fetch
+    coordinator._accounts = lambda: (SimpleNamespace(account_number="account"),)
+    return coordinator
+
+
+def capture_notifications(monkeypatch) -> tuple[list[str], list[str]]:
+    """Record every persistent notification the coordinator tries to touch."""
+    created: list[str] = []
+    dismissed: list[str] = []
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.persistent_notification.async_create",
+        lambda hass, message, title=None, notification_id=None: created.append(notification_id),
+    )
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.persistent_notification.async_dismiss",
+        lambda hass, notification_id: dismissed.append(notification_id),
+    )
+    return created, dismissed
+
+
+def notification_ids(kind: str, ids: list[str]) -> list[str]:
+    return [value for value in ids if f"_{kind}_" in value]
+
+
+def warning_messages(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+
+
+def yesterdays_kwh_description():
+    return next(
+        description
+        for description in REALTIME_DESCRIPTIONS
+        if description.suffix == SUFFIX_YESTERDAY_KWH
+    )
+
+
+def test_realtime_coordinator_treats_missing_yesterday_usage_as_a_gap(monkeypatch, caplog) -> None:
+    """An unpublished yesterday reading must not be reported as a failure."""
+    caplog.set_level(logging.DEBUG)
+    created, dismissed = capture_notifications(monkeypatch)
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 20))
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    coordinator = make_realtime_coordinator(ledger, FakeUsageClient(None))
+
+    data = run(coordinator._async_update_data())
+
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == 20.0
+    assert created == []
+    assert warning_messages(caplog) == []
+    assert "not published yet" in "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+    # A successful request clears any earlier usage failure.
+    assert notification_ids("usage", dismissed) == ["csg_entry_usage_account"]
+
+    yesterday = CSGSensor(
+        SimpleNamespace(data=data, last_update_success=True),
+        "account",
+        yesterdays_kwh_description(),
+    )
+    energy = CSGSensor(
+        SimpleNamespace(data=data, last_update_success=True, ledger=ledger),
+        "account",
+        ENERGY_TOTAL,
+    )
+    assert not yesterday.available
+    assert energy.available
+    assert energy.native_value == 20.0
+
+
+def test_realtime_coordinator_keeps_energy_unavailable_without_a_ledger_total(monkeypatch, caplog) -> None:
+    """An empty reading before any reading was recorded stays quiet too."""
+    caplog.set_level(logging.DEBUG)
+    created, _ = capture_notifications(monkeypatch)
+    ledger = make_ledger()
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    coordinator = make_realtime_coordinator(ledger, FakeUsageClient(None))
+
+    data = run(coordinator._async_update_data())
+
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == STATE_UNAVAILABLE
+    assert created == []
+    assert warning_messages(caplog) == []
+
+
+def test_realtime_coordinator_notifies_a_failed_yesterday_request(monkeypatch, caplog) -> None:
+    """A real request failure still warns and raises a notification."""
+    caplog.set_level(logging.DEBUG)
+    created, dismissed = capture_notifications(monkeypatch)
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 20))
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    coordinator = make_realtime_coordinator(ledger, FakeUsageClient(CSGAPIError("boom")))
+
+    data = run(coordinator._async_update_data())
+
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == 20.0
+    assert notification_ids("usage", created) == ["csg_entry_usage_account"]
+    assert notification_ids("usage", dismissed) == []
+    assert any("Could not update yesterday usage" in message for message in warning_messages(caplog))
+
+
+def test_realtime_coordinator_records_a_published_yesterday_reading(monkeypatch, caplog) -> None:
+    """A published reading is still recorded and clears earlier failures."""
+    caplog.set_level(logging.DEBUG)
+    created, dismissed = capture_notifications(monkeypatch)
+    ledger = make_ledger()
+    run(ledger.async_record_realtime("account", "2026-08-01", 20))
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 2, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    coordinator = make_realtime_coordinator(ledger, FakeUsageClient(25))
+
+    data = run(coordinator._async_update_data())
+
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == 25
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == 25.0
+    assert created == []
+    assert warning_messages(caplog) == []
+    assert notification_ids("usage", dismissed) == ["csg_entry_usage_account"]
+
+
+def test_realtime_coordinator_leaves_energy_unavailable_when_a_failed_request_has_no_total(
+    monkeypatch, caplog
+) -> None:
+    """A failed request with nothing recorded yet has no total to expose."""
+    caplog.set_level(logging.DEBUG)
+    created, dismissed = capture_notifications(monkeypatch)
+    ledger = make_ledger()
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 4, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    coordinator = make_realtime_coordinator(ledger, FakeUsageClient(CSGAPIError("boom")))
+
+    data = run(coordinator._async_update_data())
+
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == STATE_UNAVAILABLE
+    assert notification_ids("usage", created) == ["csg_entry_usage_account"]
+    assert notification_ids("usage", dismissed) == []
+
+
+class FakeRealtimeClient:
+    """Serve yesterday's reading, or raise, without network I/O."""
+
+    def __init__(self, usage: float | None = None, error: Exception | None = None) -> None:
+        self.usage = usage
+        self.error = error
+
+    def get_balance_and_arrears(self, account):
+        return 1.0, 0.0
+
+    def get_yesterday_kwh(self, account):
+        if self.error is not None:
+            raise self.error
+        return self.usage
+
+
+class FakeRealtimeCoordinator(RealtimeCoordinator):
+    """Small collaborator for testing RealtimeCoordinator._async_update_data.
+
+    Only the collaborators are replaced, so the helpers under test stay real.
+    """
+
+    def __init__(self, client: FakeRealtimeClient) -> None:
+        self.client = client
+        self.ledger = make_ledger()
+        self.notifications: list[tuple[str, str, Exception]] = []
+        self.dismissed: list[tuple[str, str]] = []
+
+    async def _client(self):
+        return self.client
+
+    def _accounts(self):
+        return [SimpleNamespace(account_number="account")]
+
+    async def _fetch(self, function, *args):
+        return function(*args)
+
+    def _notify_failure(self, account: str, kind: str, err: Exception) -> None:
+        self.notifications.append((account, kind, err))
+
+    def _clear_failure(self, account: str, kind: str) -> None:
+        self.dismissed.append((account, kind))
+
+
+def _patch_utcnow(monkeypatch) -> None:
+    """Pin the coordinator's clock so "yesterday" is a fixed day."""
+    monkeypatch.setattr(
+        "custom_components.csg.sensor.dt_util.utcnow",
+        lambda: dt.datetime(2026, 8, 3, 4, tzinfo=dt.UTC),
+    )
+
+
+def test_empty_yesterday_usage_is_not_a_failed_request(monkeypatch, caplog) -> None:
+    """An unpublished yesterday total is a data gap, not a broken account."""
+    caplog.set_level(logging.DEBUG)
+    _patch_utcnow(monkeypatch)
+    coordinator = FakeRealtimeCoordinator(FakeRealtimeClient(usage=None))
+    run(coordinator.ledger.async_record_realtime("account", "2026-08-01", 12))
+
+    data = run(RealtimeCoordinator._async_update_data(coordinator))
+
+    assert coordinator.notifications == []
+    assert ("account", "usage") in coordinator.dismissed
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == 12.0
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+    assert "not published yet" in "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+
+
+def test_failed_yesterday_usage_request_still_notifies(monkeypatch) -> None:
+    """A real yesterday request failure still reports the account as failing."""
+    _patch_utcnow(monkeypatch)
+    error = CSGAPIError("boom")
+    coordinator = FakeRealtimeCoordinator(FakeRealtimeClient(error=error))
+
+    data = run(RealtimeCoordinator._async_update_data(coordinator))
+
+    assert coordinator.notifications == [("account", "usage", error)]
+    assert ("account", "usage") not in coordinator.dismissed
+    assert data["account"][SUFFIX_YESTERDAY_KWH] == STATE_UNAVAILABLE
+    assert data["account"][SUFFIX_ENERGY_TOTAL] == STATE_UNAVAILABLE
