@@ -148,62 +148,113 @@ def freeze_utcnow(monkeypatch, moment: dt.datetime) -> None:
 
 
 def test_energy_ramp_starts_when_the_reading_arrives(monkeypatch) -> None:
-    """The first poll after a reading pays out only the time since it arrived.
+    """The exposed total does not jump at the moment a reading arrives.
 
-    The ramp used to start at midnight, so a total published at 10:00 handed
-    back ten hours of usage in the single update that delivered it: the flat
+    The ramp used to start at midnight, so a day total published at 11:00 paid
+    out eleven hours of usage in the single update that delivered it: the flat
     line, wall, slow rise shape on the energy dashboard.
     """
     ledger = make_ledger()
-    # 2026-08-02 10:00 in China Standard Time.
-    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 2, tzinfo=dt.UTC))
+    # 2026-08-02 11:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 3, tzinfo=dt.UTC))
     run(ledger.async_record_realtime("account", "2026-08-01", 24))
 
+    cst = ZoneInfo("Asia/Shanghai")
+    before_arrival = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 10, 59, tzinfo=cst)
+    )
     at_arrival = ledger.energy_total_at(
-        "account", dt.datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+        "account", dt.datetime(2026, 8, 2, 11, tzinfo=cst)
     )
-    at_seventeen = ledger.energy_total_at(
-        "account", dt.datetime(2026, 8, 2, 17, tzinfo=ZoneInfo("Asia/Shanghai"))
+    at_eighteen = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 18, tzinfo=cst)
     )
-    at_end_of_day = ledger.energy_total_at(
-        "account",
-        dt.datetime(2026, 8, 2, 23, 59, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+    at_next_midnight = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 3, tzinfo=cst)
     )
 
-    # Nothing is paid out for the ten hours that elapsed before the reading.
-    assert at_arrival == 0
-    assert at_seventeen == pytest.approx(12)
-    # The ledger's cumulative total is still reached by the end of the ramp day.
-    assert at_end_of_day == pytest.approx(24, abs=0.01)
-    assert (
-        ledger.energy_total_at(
-            "account", dt.datetime(2026, 8, 3, tzinfo=ZoneInfo("Asia/Shanghai"))
-        )
-        == 24
-    )
+    # Nothing is paid out for the eleven hours elapsed before the reading.
+    assert at_arrival == before_arrival == 0
+    # 18:00 is seven of the thirteen hours between the arrival and 24:00.
+    assert at_eighteen == pytest.approx(before_arrival + 24 * 7 / 13)
+    # The ledger's cumulative total is still reached exactly by 24:00.
+    assert at_next_midnight == 24
 
 
 def test_energy_ramp_keeps_its_anchor_when_a_reading_is_revised(monkeypatch) -> None:
-    """A revision must not move the ramp start and step the total backwards."""
-    ledger = make_ledger()
-    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 2, tzinfo=dt.UTC))
-    run(ledger.async_record_realtime("account", "2026-08-01", 24))
-    anchor = ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"]
+    """A revision must not move the ramp start and step the total backwards.
 
-    # 2026-08-02 16:00 in China Standard Time.
-    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 8, tzinfo=dt.UTC))
-    run(ledger.async_record_realtime("account", "2026-08-01", 30))
+    Moving the anchor to the revision time would restart the ramp from a
+    shorter window with a larger day total, so the exposed value could drop.
+    Home Assistant books a drop on a total increasing sensor as a meter reset
+    and records the whole new value as consumption.
+    """
+    ledger = make_ledger()
+    cst = ZoneInfo("Asia/Shanghai")
+    # 2026-08-02 06:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 1, 22, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 20))
+    anchor = ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"]
+    assert anchor == "2026-08-01T22:00:00+00:00"
+
+    # 2026-08-02 15:00 in China Standard Time.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 7, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-08-01", 24))
 
     assert ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"] == anchor
-    assert (
-        ledger.energy_total_at(
-            "account", dt.datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
-        )
-        == 0
+    # The ramp still runs from 06:00 to 24:00, so 15:00 is its midpoint.
+    at_fourteen_fiftyfive = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 14, 55, tzinfo=cst)
     )
-    assert ledger.energy_total_at(
-        "account", dt.datetime(2026, 8, 2, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
-    ) == pytest.approx(30 * 6 / 14)
+    at_fifteen = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 15, tzinfo=cst)
+    )
+    assert at_fifteen == pytest.approx(12)
+    assert at_fifteen >= at_fourteen_fiftyfive
+
+
+def test_energy_ramp_samples_a_day_without_a_wall(monkeypatch) -> None:
+    """A five minute sample of the ramp day never steps by a day's share.
+
+    The day before is already counted, so the exposed sensor holds the ledger
+    total until yesterday's reading arrives at 11:00. The old midnight anchor
+    paid out the eleven hours that had already elapsed the moment it arrived -
+    an 11 kWh step - and then crawled. Anchoring the ramp at the arrival
+    spreads the same 24 kWh over the thirteen hours that are left, so a five
+    minute step is about 0.15 kWh.
+    """
+    ledger = make_ledger()
+    cst = ZoneInfo("Asia/Shanghai")
+    # 2026-07-31's reading arrived on 2026-08-01 at 11:00 CST.
+    freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 1, 3, tzinfo=dt.UTC))
+    run(ledger.async_record_realtime("account", "2026-07-31", 24))
+
+    step = dt.timedelta(minutes=5)
+    start = dt.datetime(2026, 8, 2, tzinfo=cst)
+    arrival = dt.datetime(2026, 8, 2, 11, tzinfo=cst)
+    arrival_index = int((arrival - start) / step)
+    samples: list[float] = []
+    arrived = False
+    for index in range(int(dt.timedelta(days=1) / step)):
+        moment = start + step * index
+        if not arrived and moment >= arrival:
+            # 2026-08-02 11:00 in China Standard Time.
+            freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 3, tzinfo=dt.UTC))
+            run(ledger.async_record_realtime("account", "2026-08-01", 24))
+            arrived = True
+        samples.append(ledger.energy_total_at("account", moment))
+
+    steps = [later - earlier for earlier, later in zip(samples, samples[1:])]
+
+    # The reading pays out nothing for the hours elapsed before it arrived.
+    assert samples[arrival_index] == samples[arrival_index - 1] == 24
+    assert all(value >= 0 for value in steps)
+    assert max(steps) < 24 / 24
+    # The ramp never overshoots the ledger's cumulative total.
+    assert samples[-1] <= 48
+    assert (
+        ledger.energy_total_at("account", dt.datetime(2026, 8, 3, tzinfo=cst)) == 48
+    )
 
 
 def test_energy_ramp_ignores_an_anchor_outside_the_ramp_day(monkeypatch) -> None:
