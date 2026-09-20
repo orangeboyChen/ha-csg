@@ -197,6 +197,12 @@ def test_energy_ramp_keeps_its_anchor_when_a_reading_is_revised(monkeypatch) -> 
     anchor = ledger._data["accounts"]["account"]["counted_at"]["2026-08-01"]
     assert anchor == "2026-08-01T22:00:00+00:00"
 
+    # A revision is booked as a meter reset if the exposed value steps down,
+    # so the reading at the revision moment must rise or hold, never fall.
+    before_revision = ledger.energy_total_at(
+        "account", dt.datetime(2026, 8, 2, 15, tzinfo=cst)
+    )
+
     # 2026-08-02 15:00 in China Standard Time.
     freeze_utcnow(monkeypatch, dt.datetime(2026, 8, 2, 7, tzinfo=dt.UTC))
     run(ledger.async_record_realtime("account", "2026-08-01", 24))
@@ -211,6 +217,13 @@ def test_energy_ramp_keeps_its_anchor_when_a_reading_is_revised(monkeypatch) -> 
     )
     assert at_fifteen == pytest.approx(12)
     assert at_fifteen >= at_fourteen_fiftyfive
+    # 10 kWh at the old reading, 12 kWh at the revision: up, never down.
+    assert before_revision == pytest.approx(10)
+    assert at_fifteen >= before_revision
+    # The ledger's cumulative total is still reached exactly by 24:00.
+    assert (
+        ledger.energy_total_at("account", dt.datetime(2026, 8, 3, tzinfo=cst)) == 24
+    )
 
 
 def test_energy_ramp_samples_a_day_without_a_wall(monkeypatch) -> None:
